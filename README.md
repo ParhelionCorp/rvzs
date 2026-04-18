@@ -1,2 +1,2 @@
 # rvzs
-advance video scraper utilized by Parhelion Corp.
+- Advance And Final Project Of My Video Scraping Userscript.
