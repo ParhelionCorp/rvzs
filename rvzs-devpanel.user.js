@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         rvzs — DevPanel
 // @namespace    https://github.com/Celesth/rvzs
-// @version      1.0.0
-// @description  Code executor + filtered request logger with shadcn B&W aesthetic
+// @version      2.0.0
+// @description  Resizable code executor (multi-tab, userscript-level access) + network logger with yt-dlp builder
 // @author       Celesth
 // @match        *://*/*
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @run-at       document-start
 // @connect      *
@@ -15,16 +16,54 @@
 (function () {
   'use strict';
 
+  const VIDEO_EXT = /\.(mp4|webm|mkv|mov|avi|flv|m4v|ts|m2ts|mts|mp2t|m3u8|mpd|f4v|ogg|ogv|3gp)(\?[^"]*)?$/i;
+
+  // ─── Cookie helpers ──────────────────────────────────────────────────────────
+  function getSiteCookies() {
+    try {
+      const raw = document.cookie;
+      return raw ? raw.split(';').map(s => s.trim()).filter(Boolean).join('; ') : '';
+    } catch { return ''; }
+  }
+
+  // ─── yt-dlp command builder ──────────────────────────────────────────────────
+  function buildYtdlpCmd(url) {
+    const cookies = getSiteCookies();
+    const origin  = location.origin;
+    const referer = location.href;
+    const ua      = navigator.userAgent;
+    const parts   = [
+      'yt-dlp',
+      `--extractor-args "generic:impersonate"`,
+      `--add-header "Origin: ${origin}"`,
+      `--add-header "Referer: ${referer}"`,
+      `--add-header "User-Agent: ${ua}"`,
+      cookies ? `--add-header "Cookie: ${cookies}"` : '',
+      `-o "%(title)s.%(ext)s"`,
+      `"${url}"`,
+    ].filter(Boolean);
+    return parts.join(' \\\n  ');
+  }
+
   // ─── State ───────────────────────────────────────────────────────────────────
   const state = {
-    open:    false,
-    tab:     'executor',
-    logs:    [],        // { id, method, url, status, type, ts, duration, size, headers }
-    filter:  '',
-    logId:   0,
-    history: [],        // code history
-    histIdx: -1,
+    open:          false,
+    tab:           'executor',
+    logs:          [],
+    filter:        '',
+    methodFilter:  'ALL',
+    execTabs:      [{ id: 1, title: 'Tab 1', code: '' }],
+    activeExecTab: 1,
+    execTabId:     1,
+    history:       [],
+    histIdx:       -1,
+    panelW:        760,
+    panelH:        560,
+    panelL:        20,   // left px
+    panelB:        20,   // bottom px
   };
+
+  const _detailOpen = new Set(); // log IDs with detail rows visible
 
   // ─── Request intercept ───────────────────────────────────────────────────────
   let _lid = 0;
@@ -33,64 +72,45 @@
   function addLog(entry) {
     state.logs.unshift(entry);
     if (state.logs.length > 500) state.logs.pop();
-    if (state.tab === 'logger') renderLogger();
+    if (state.tab === 'logger') prependLogRow(entry);
   }
 
-  // XHR hook
   const OrigXHR = unsafeWindow.XMLHttpRequest;
   class HookedXHR extends OrigXHR {
-    open(method, url, ...rest) {
-      this._dp_method = method;
-      this._dp_url    = url;
-      this._dp_start  = 0;
-      return super.open(method, url, ...rest);
-    }
-    send(...args) {
-      this._dp_start = Date.now();
+    open(m, u, ...r) { this._m = m; this._u = u; this._t = 0; return super.open(m, u, ...r); }
+    send(...a) {
+      this._t = Date.now();
       this.addEventListener('readystatechange', () => {
-        if (this.readyState === 4) {
-          addLog({
-            id:       nid(),
-            method:   this._dp_method || 'GET',
-            url:      this._dp_url || '',
-            status:   this.status,
-            type:     (this.getResponseHeader('content-type') || '').split(';')[0] || '—',
-            ts:       Date.now(),
-            duration: Date.now() - (this._dp_start || Date.now()),
-            size:     this.getResponseHeader('content-length') || '?',
-            src:      'XHR',
-          });
-        }
+        if (this.readyState === 4) addLog({
+          id: nid(), method: (this._m || 'GET').toUpperCase(), url: this._u || '',
+          status: this.status,
+          type: (this.getResponseHeader('content-type') || '').split(';')[0] || '—',
+          ts: Date.now(), duration: Date.now() - (this._t || Date.now()),
+          size: this.getResponseHeader('content-length') || '?', src: 'XHR',
+        });
       });
-      return super.send(...args);
+      return super.send(...a);
     }
   }
   unsafeWindow.XMLHttpRequest = HookedXHR;
 
-  // Fetch hook
-  const origFetch = unsafeWindow.fetch;
+  const _origFetch = unsafeWindow.fetch;
   unsafeWindow.fetch = async function (input, init) {
     const url    = typeof input === 'string' ? input : input?.url || '';
-    const method = init?.method || (typeof input === 'object' ? input?.method : null) || 'GET';
+    const method = (init?.method || (typeof input === 'object' ? input?.method : null) || 'GET').toUpperCase();
     const start  = Date.now();
     try {
-      const res  = await origFetch.apply(this, arguments);
-      const dur  = Date.now() - start;
+      const res = await _origFetch.apply(this, arguments);
       addLog({
-        id:       nid(),
-        method:   method.toUpperCase(),
-        url,
-        status:   res.status,
-        type:     (res.headers.get('content-type') || '').split(';')[0] || '—',
-        ts:       Date.now(),
-        duration: dur,
-        size:     res.headers.get('content-length') || '?',
-        src:      'fetch',
+        id: nid(), method, url, status: res.status,
+        type: (res.headers.get('content-type') || '').split(';')[0] || '—',
+        ts: Date.now(), duration: Date.now() - start,
+        size: res.headers.get('content-length') || '?', src: 'fetch',
       });
       return res;
-    } catch (err) {
-      addLog({ id: nid(), method: method.toUpperCase(), url, status: 0, type: 'error', ts: Date.now(), duration: Date.now() - start, size: '?', src: 'fetch' });
-      throw err;
+    } catch (e) {
+      addLog({ id: nid(), method, url, status: 0, type: 'error', ts: Date.now(), duration: Date.now() - start, size: '?', src: 'fetch' });
+      throw e;
     }
   };
 
@@ -99,342 +119,382 @@
     @import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500;600;700&display=swap');
 
     :root {
-      --dp-bg:       #09090b;
-      --dp-surface:  #0f0f11;
-      --dp-border:   #27272a;
-      --dp-border2:  #3f3f46;
-      --dp-text:     #fafafa;
-      --dp-muted:    #71717a;
-      --dp-muted2:   #52525b;
-      --dp-accent:   #ffffff;
-      --dp-dim:      #18181b;
-      --dp-input:    #0f0f11;
-      --dp-hover:    #1c1c1f;
-      --dp-ok:       #4ade80;
-      --dp-err:      #f87171;
-      --dp-warn:     #facc15;
-      --dp-info:     #60a5fa;
-      --dp-font:     'Geist Mono', 'JetBrains Mono', monospace;
-      --dp-r:        6px;
-      --dp-shadow:   0 0 0 1px #27272a, 0 8px 32px rgba(0,0,0,0.8);
+      --dp-bg:      #09090b;
+      --dp-surface: #0f0f11;
+      --dp-border:  #27272a;
+      --dp-border2: #3f3f46;
+      --dp-text:    #fafafa;
+      --dp-muted:   #71717a;
+      --dp-muted2:  #52525b;
+      --dp-dim:     #18181b;
+      --dp-hover:   #1c1c1f;
+      --dp-ok:      #4ade80;
+      --dp-err:     #f87171;
+      --dp-warn:    #facc15;
+      --dp-info:    #60a5fa;
+      --dp-font:    'Geist Mono','JetBrains Mono',monospace;
+      --dp-r:       6px;
+      --dp-shadow:  0 0 0 1px #27272a, 0 20px 60px rgba(0,0,0,0.95);
     }
 
     /* ── FAB ── */
     #dp-fab {
-      position: fixed; bottom: 20px; left: 20px;
-      z-index: 2147483647;
+      position: fixed; bottom: 20px; left: 20px; z-index: 2147483647;
       width: 40px; height: 40px; border-radius: var(--dp-r);
-      background: var(--dp-text); color: var(--dp-bg);
-      border: none; cursor: pointer;
+      background: var(--dp-text); color: var(--dp-bg); border: none; cursor: pointer;
       display: flex; align-items: center; justify-content: center;
       box-shadow: 0 2px 12px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.1);
-      transition: transform .15s ease, box-shadow .15s ease;
+      transition: transform .15s, box-shadow .15s;
       font-family: var(--dp-font); font-size: 14px; font-weight: 700;
-      letter-spacing: -.03em;
-      -webkit-tap-highlight-color: transparent;
+      -webkit-tap-highlight-color: transparent; user-select: none;
     }
-    #dp-fab:hover  { transform: scale(1.05); box-shadow: 0 4px 20px rgba(0,0,0,0.8), 0 0 0 1px rgba(255,255,255,0.15); }
-    #dp-fab:active { transform: scale(0.97); }
+    #dp-fab:hover  { transform: scale(1.06); box-shadow: 0 4px 20px rgba(0,0,0,0.8); }
+    #dp-fab:active { transform: scale(0.96); }
 
     /* ── Panel ── */
     #dp-panel {
-      position: fixed;
-      bottom: 20px; left: 20px;
-      z-index: 2147483646;
-      width: min(760px, calc(100vw - 40px));
-      height: min(560px, calc(100vh - 40px));
-      background: var(--dp-bg);
-      border: 1px solid var(--dp-border);
-      border-radius: 10px;
-      display: flex; flex-direction: column; overflow: hidden;
-      box-shadow: var(--dp-shadow);
-      font-family: var(--dp-font);
-      transform: scale(0.96) translateY(8px);
-      opacity: 0; pointer-events: none;
-      transform-origin: bottom left;
+      position: fixed; z-index: 2147483646;
+      background: var(--dp-bg); border: 1px solid var(--dp-border);
+      border-radius: 10px; display: flex; flex-direction: column;
+      box-shadow: var(--dp-shadow); font-family: var(--dp-font);
+      transform: scale(0.96) translateY(8px); opacity: 0; pointer-events: none;
+      transform-origin: bottom left; overflow: hidden;
       transition: transform .2s cubic-bezier(.34,1.3,.64,1), opacity .15s ease;
+      min-width: 400px; min-height: 280px;
     }
-    #dp-panel.open { transform: none; opacity: 1; pointer-events: all; }
+    #dp-panel.open     { transform: none; opacity: 1; pointer-events: all; }
+    #dp-panel.resizing { transition: none; user-select: none; }
 
-    /* ── Titlebar ── */
+    /* ── Resize handles ── */
+    .dp-rz {
+      position: absolute; z-index: 20; background: transparent;
+    }
+    .dp-rz-n  { top:-3px;   left:10px;  right:10px;  height:7px;  cursor:n-resize;  }
+    .dp-rz-s  { bottom:-3px;left:10px;  right:10px;  height:7px;  cursor:s-resize;  }
+    .dp-rz-e  { right:-3px; top:10px;   bottom:10px; width:7px;   cursor:e-resize;  }
+    .dp-rz-w  { left:-3px;  top:10px;   bottom:10px; width:7px;   cursor:w-resize;  }
+    .dp-rz-ne { top:-3px;   right:-3px; width:12px;  height:12px; cursor:ne-resize; }
+    .dp-rz-nw { top:-3px;   left:-3px;  width:12px;  height:12px; cursor:nw-resize; }
+    .dp-rz-se { bottom:-3px;right:-3px; width:14px;  height:14px; cursor:se-resize; z-index:21; }
+    .dp-rz-sw { bottom:-3px;left:-3px;  width:12px;  height:12px; cursor:sw-resize; }
+    /* Visible corner grip */
+    .dp-rz-se::after {
+      content:'';position:absolute;bottom:4px;right:4px;
+      width:8px;height:8px;
+      border-right:2px solid var(--dp-border2);
+      border-bottom:2px solid var(--dp-border2);
+      border-radius:1px; opacity:.6;
+    }
+
+    /* ── Titlebar (drag handle) ── */
     #dp-titlebar {
-      display: flex; align-items: center;
-      padding: 0 14px;
-      height: 42px;
-      border-bottom: 1px solid var(--dp-border);
-      flex-shrink: 0;
-      gap: 10px;
-      background: var(--dp-surface);
+      display:flex; align-items:center;
+      padding:0 14px; height:42px; flex-shrink:0;
+      border-bottom:1px solid var(--dp-border);
+      background:var(--dp-surface);
+      cursor:move; user-select:none;
     }
-    .dp-dots { display: flex; gap: 6px; }
-    .dp-dot  {
-      width: 11px; height: 11px; border-radius: 50%;
-      border: 1px solid rgba(255,255,255,0.08);
-    }
-    .dp-dot-r { background: #ff5f57; }
-    .dp-dot-y { background: #febc2e; }
-    .dp-dot-g { background: #28c840; }
+    .dp-dots { display:flex; gap:6px; flex-shrink:0; }
+    .dp-dot  { width:11px; height:11px; border-radius:50%; border:1px solid rgba(255,255,255,0.08); }
+    .dp-dot-r{ background:#ff5f57; } .dp-dot-y{ background:#febc2e; } .dp-dot-g{ background:#28c840; }
     #dp-title {
-      font-size: 11px; font-weight: 500; color: var(--dp-muted);
-      letter-spacing: .04em; flex: 1;
+      font-size:11px; font-weight:500; color:var(--dp-muted);
+      letter-spacing:.04em; flex:1; padding-left:10px; pointer-events:none;
     }
     .dp-close {
-      background: none; border: none; color: var(--dp-muted2);
-      cursor: pointer; font-size: 14px; padding: 4px 6px;
-      border-radius: 4px; line-height: 1;
-      transition: color .1s, background .1s;
-      font-family: var(--dp-font);
-      -webkit-tap-highlight-color: transparent;
+      background:none; border:none; color:var(--dp-muted2); cursor:pointer;
+      font-size:14px; padding:4px 6px; border-radius:4px; line-height:1;
+      transition:color .1s,background .1s; font-family:var(--dp-font);
+      -webkit-tap-highlight-color:transparent;
     }
-    .dp-close:hover { color: var(--dp-text); background: var(--dp-hover); }
+    .dp-close:hover { color:var(--dp-text); background:var(--dp-hover); }
 
-    /* ── Tab bar ── */
+    /* ── Main tabs ── */
     #dp-tabs {
-      display: flex; gap: 0;
-      border-bottom: 1px solid var(--dp-border);
-      flex-shrink: 0;
-      background: var(--dp-surface);
-      padding: 0 10px;
+      display:flex; gap:0; border-bottom:1px solid var(--dp-border);
+      flex-shrink:0; background:var(--dp-surface); padding:0 10px;
     }
     .dp-tab {
-      padding: 9px 14px; font-size: 11px; font-weight: 500;
-      font-family: var(--dp-font);
-      border: none; background: none; color: var(--dp-muted);
-      cursor: pointer; letter-spacing: .04em;
-      border-bottom: 2px solid transparent;
-      margin-bottom: -1px;
-      transition: color .12s, border-color .12s;
-      -webkit-tap-highlight-color: transparent;
+      padding:9px 14px; font-size:11px; font-weight:500;
+      font-family:var(--dp-font); border:none; background:none;
+      color:var(--dp-muted); cursor:pointer; letter-spacing:.04em;
+      border-bottom:2px solid transparent; margin-bottom:-1px;
+      transition:color .12s, border-color .12s;
+      -webkit-tap-highlight-color:transparent;
     }
-    .dp-tab:hover { color: var(--dp-text); }
-    .dp-tab.active { color: var(--dp-text); border-bottom-color: var(--dp-text); }
+    .dp-tab:hover { color:var(--dp-text); }
+    .dp-tab.active { color:var(--dp-text); border-bottom-color:var(--dp-text); }
 
-    /* ── Content areas ── */
-    #dp-executor, #dp-logger { display: none; flex: 1; flex-direction: column; overflow: hidden; }
-    #dp-executor.active, #dp-logger.active { display: flex; }
+    /* ── Panels ── */
+    #dp-executor, #dp-logger { display:none; flex:1; flex-direction:column; overflow:hidden; min-height:0; }
+    #dp-executor.active, #dp-logger.active { display:flex; }
 
-    /* ── Executor ── */
-    #dp-exec-editor-wrap {
-      flex: 1; position: relative; overflow: hidden;
-      border-bottom: 1px solid var(--dp-border);
+    /* ── Exec tab strip ── */
+    #dp-exec-tabs-bar {
+      display:flex; align-items:center;
+      border-bottom:1px solid var(--dp-border);
+      background:var(--dp-surface); flex-shrink:0;
+      overflow-x:auto; scrollbar-width:none; gap:0;
     }
-    #dp-exec-header {
-      display: flex; align-items: center; gap: 8px;
-      padding: 8px 12px;
-      border-bottom: 1px solid var(--dp-border);
-      background: var(--dp-surface); flex-shrink: 0;
+    #dp-exec-tabs-bar::-webkit-scrollbar { display:none; }
+    .dp-exec-tab {
+      display:flex; align-items:center; gap:6px;
+      padding:6px 12px 6px 14px; font-size:10px; font-weight:500;
+      font-family:var(--dp-font); border:none;
+      border-right:1px solid var(--dp-border);
+      background:none; color:var(--dp-muted); cursor:pointer;
+      letter-spacing:.03em; white-space:nowrap;
+      transition:color .1s, background .1s; position:relative;
+      min-width:80px;
+    }
+    .dp-exec-tab:hover { color:var(--dp-text); background:var(--dp-hover); }
+    .dp-exec-tab.active { color:var(--dp-text); background:var(--dp-bg); }
+    .dp-exec-tab.active::after {
+      content:''; position:absolute; bottom:0; left:0; right:0; height:2px;
+      background:var(--dp-text);
+    }
+    .dp-exec-tab-close {
+      display:inline-flex; align-items:center; justify-content:center;
+      width:14px; height:14px; border-radius:3px;
+      font-size:10px; line-height:1; color:var(--dp-muted2);
+      transition:color .1s, background .1s;
+      border:none; background:none; cursor:pointer; padding:0;
+      font-family:var(--dp-font);
+    }
+    .dp-exec-tab-close:hover { color:var(--dp-text); background:var(--dp-border); }
+    #dp-new-tab-btn {
+      padding:6px 12px; font-size:16px; line-height:1; color:var(--dp-muted2);
+      background:none; border:none; cursor:pointer; flex-shrink:0;
+      transition:color .1s; font-family:var(--dp-font);
+    }
+    #dp-new-tab-btn:hover { color:var(--dp-text); }
+
+    /* ── Exec toolbar ── */
+    #dp-exec-toolbar {
+      display:flex; align-items:center; gap:6px; padding:6px 12px;
+      border-bottom:1px solid var(--dp-border);
+      background:var(--dp-surface); flex-shrink:0;
     }
     .dp-badge {
-      font-size: 9px; font-weight: 600; letter-spacing: .08em;
-      padding: 2px 7px; border-radius: 3px;
-      border: 1px solid var(--dp-border2);
-      color: var(--dp-muted); background: var(--dp-dim);
+      font-size:9px; font-weight:600; letter-spacing:.08em;
+      padding:2px 7px; border-radius:3px;
+      border:1px solid var(--dp-border2);
+      color:var(--dp-muted); background:var(--dp-dim);
     }
-    #dp-exec-actions { margin-left: auto; display: flex; gap: 6px; }
+    #dp-exec-actions { margin-left:auto; display:flex; gap:6px; }
+
+    /* ── Buttons ── */
     .dp-btn {
-      font-family: var(--dp-font); font-size: 10px; font-weight: 600;
-      letter-spacing: .05em; padding: 4px 12px; border-radius: var(--dp-r);
-      cursor: pointer; transition: all .12s; border: 1px solid;
-      -webkit-tap-highlight-color: transparent;
+      font-family:var(--dp-font); font-size:10px; font-weight:600;
+      letter-spacing:.05em; padding:4px 12px; border-radius:var(--dp-r);
+      cursor:pointer; transition:all .12s; border:1px solid;
+      -webkit-tap-highlight-color:transparent;
     }
     .dp-btn-ghost {
-      background: transparent; border-color: var(--dp-border2); color: var(--dp-muted);
+      background:transparent; border-color:var(--dp-border2); color:var(--dp-muted);
     }
-    .dp-btn-ghost:hover { border-color: var(--dp-text); color: var(--dp-text); background: var(--dp-hover); }
+    .dp-btn-ghost:hover { border-color:var(--dp-text); color:var(--dp-text); background:var(--dp-hover); }
     .dp-btn-primary {
-      background: var(--dp-text); border-color: var(--dp-text); color: var(--dp-bg);
+      background:var(--dp-text); border-color:var(--dp-text); color:var(--dp-bg);
     }
-    .dp-btn-primary:hover { background: #e4e4e7; border-color: #e4e4e7; }
-    .dp-btn-primary:active { background: #d4d4d8; }
+    .dp-btn-primary:hover  { background:#e4e4e7; border-color:#e4e4e7; }
+    .dp-btn-primary:active { background:#d4d4d8; }
 
-    #dp-textarea {
-      width: 100%; height: 100%;
-      background: var(--dp-bg); color: var(--dp-text);
-      border: none; outline: none; resize: none;
-      font-family: var(--dp-font); font-size: 12.5px; line-height: 1.7;
-      padding: 14px 16px;
-      tab-size: 2; caret-color: var(--dp-text);
-      box-sizing: border-box;
-    }
-    #dp-textarea::selection { background: rgba(255,255,255,0.15); }
-    #dp-textarea::placeholder { color: var(--dp-muted2); }
-
-    /* line numbers gutter */
-    #dp-exec-editor-wrap {
-      display: flex;
+    /* ── Editor area ── */
+    #dp-editor-area {
+      display:flex; flex:1; overflow:hidden; min-height:0;
     }
     #dp-gutter {
-      width: 42px; flex-shrink: 0;
-      background: var(--dp-surface);
-      border-right: 1px solid var(--dp-border);
-      padding: 14px 0;
-      overflow: hidden;
-      user-select: none;
+      width:44px; flex-shrink:0; background:var(--dp-surface);
+      border-right:1px solid var(--dp-border);
+      padding:14px 0; overflow:hidden; user-select:none;
     }
     .dp-lnum {
-      display: block; font-family: var(--dp-font); font-size: 11px;
-      color: var(--dp-muted2); line-height: 1.7;
-      text-align: right; padding-right: 10px;
+      display:block; font-family:var(--dp-font); font-size:11px;
+      color:var(--dp-muted2); line-height:1.7;
+      text-align:right; padding-right:10px;
     }
+    #dp-textarea {
+      flex:1; background:var(--dp-bg); color:var(--dp-text);
+      border:none; outline:none; resize:none;
+      font-family:var(--dp-font); font-size:12.5px; line-height:1.7;
+      padding:14px 16px; tab-size:2; caret-color:var(--dp-text);
+      box-sizing:border-box;
+    }
+    #dp-textarea::selection { background:rgba(255,255,255,0.15); }
+    #dp-textarea::placeholder { color:var(--dp-muted2); }
 
+    /* ── Output ── */
     #dp-output-wrap {
-      height: 140px; flex-shrink: 0;
-      display: flex; flex-direction: column;
-      border-top: 1px solid var(--dp-border);
+      flex-shrink:0; display:flex; flex-direction:column;
+      border-top:1px solid var(--dp-border);
+      height:130px;
     }
     #dp-output-header {
-      display: flex; align-items: center; gap: 8px;
-      padding: 6px 12px;
-      border-bottom: 1px solid var(--dp-border);
-      background: var(--dp-surface); flex-shrink: 0;
+      display:flex; align-items:center; gap:8px; padding:5px 12px;
+      border-bottom:1px solid var(--dp-border);
+      background:var(--dp-surface); flex-shrink:0;
     }
-    #dp-output-title { font-size: 10px; font-weight: 600; color: var(--dp-muted); letter-spacing: .06em; }
-    #dp-output-clear { margin-left: auto; }
+    #dp-output-title { font-size:10px; font-weight:600; color:var(--dp-muted); letter-spacing:.06em; }
     #dp-output {
-      flex: 1; overflow-y: auto; padding: 8px 14px;
-      scrollbar-width: thin; scrollbar-color: var(--dp-border2) transparent;
+      flex:1; overflow-y:auto; padding:6px 14px;
+      scrollbar-width:thin; scrollbar-color:var(--dp-border2) transparent;
     }
-    #dp-output::-webkit-scrollbar { width: 4px; }
-    #dp-output::-webkit-scrollbar-thumb { background: var(--dp-border2); border-radius: 2px; }
+    #dp-output::-webkit-scrollbar { width:4px; }
+    #dp-output::-webkit-scrollbar-thumb { background:var(--dp-border2); border-radius:2px; }
     .dp-out-line {
-      font-size: 11.5px; line-height: 1.65; padding: 1px 0;
-      font-family: var(--dp-font); word-break: break-all;
+      font-size:11.5px; line-height:1.65; padding:1px 0;
+      font-family:var(--dp-font); word-break:break-all;
     }
-    .dp-out-log   { color: var(--dp-text); }
-    .dp-out-info  { color: var(--dp-info); }
-    .dp-out-warn  { color: var(--dp-warn); }
-    .dp-out-error { color: var(--dp-err); }
-    .dp-out-ret   { color: var(--dp-muted); }
-    .dp-out-ret::before { content: '← '; color: var(--dp-muted2); }
-    .dp-out-ts    { color: var(--dp-muted2); margin-right: 8px; font-size: 10px; }
+    .dp-out-log   { color:var(--dp-text); }
+    .dp-out-info  { color:var(--dp-info); }
+    .dp-out-warn  { color:var(--dp-warn); }
+    .dp-out-error { color:var(--dp-err); }
+    .dp-out-ret   { color:var(--dp-muted); }
+    .dp-out-ret::before { content:'← '; color:var(--dp-muted2); }
+    .dp-out-ts    { color:var(--dp-muted2); margin-right:8px; font-size:10px; }
 
-    /* ── Logger ── */
+    /* ── Logger toolbar ── */
     #dp-log-toolbar {
-      display: flex; align-items: center; gap: 8px;
-      padding: 8px 12px;
-      border-bottom: 1px solid var(--dp-border);
-      background: var(--dp-surface); flex-shrink: 0;
+      display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+      padding:7px 12px; border-bottom:1px solid var(--dp-border);
+      background:var(--dp-surface); flex-shrink:0;
     }
-    #dp-search-wrap { position: relative; flex: 1; }
-    #dp-search-icon {
-      position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
-      color: var(--dp-muted2); pointer-events: none; font-size: 13px;
-    }
+    #dp-search-wrap { position:relative; flex:1; min-width:120px; }
+    #dp-search-icon { position:absolute; left:9px; top:50%; transform:translateY(-50%); color:var(--dp-muted2); pointer-events:none; font-size:13px; }
     #dp-search {
-      width: 100%; background: var(--dp-input);
-      border: 1px solid var(--dp-border); border-radius: var(--dp-r);
-      color: var(--dp-text); font-family: var(--dp-font); font-size: 11px;
-      padding: 5px 10px 5px 30px; outline: none;
-      transition: border-color .12s; box-sizing: border-box;
+      width:100%; background:var(--dp-dim); border:1px solid var(--dp-border);
+      border-radius:var(--dp-r); color:var(--dp-text); font-family:var(--dp-font);
+      font-size:11px; padding:5px 10px 5px 28px; outline:none;
+      transition:border-color .12s; box-sizing:border-box;
     }
-    #dp-search:focus { border-color: var(--dp-border2); }
-    #dp-search::placeholder { color: var(--dp-muted2); }
+    #dp-search:focus { border-color:var(--dp-border2); }
+    #dp-search::placeholder { color:var(--dp-muted2); }
 
-    .dp-method-filter {
-      display: flex; gap: 4px;
-    }
+    .dp-method-filter { display:flex; gap:3px; flex-wrap:wrap; }
     .dp-mf-btn {
-      font-family: var(--dp-font); font-size: 9px; font-weight: 600;
-      letter-spacing: .06em; padding: 3px 8px; border-radius: 4px;
-      border: 1px solid var(--dp-border); background: transparent;
-      color: var(--dp-muted); cursor: pointer; transition: all .1s;
+      font-family:var(--dp-font); font-size:9px; font-weight:600; letter-spacing:.06em;
+      padding:3px 8px; border-radius:4px; border:1px solid var(--dp-border);
+      background:transparent; color:var(--dp-muted); cursor:pointer; transition:all .1s;
     }
-    .dp-mf-btn:hover { border-color: var(--dp-border2); color: var(--dp-text); }
-    .dp-mf-btn.active { background: var(--dp-text); border-color: var(--dp-text); color: var(--dp-bg); }
+    .dp-mf-btn:hover { border-color:var(--dp-border2); color:var(--dp-text); }
+    .dp-mf-btn.active { background:var(--dp-text); border-color:var(--dp-text); color:var(--dp-bg); }
+    #dp-log-count { font-size:10px; color:var(--dp-muted2); white-space:nowrap; font-weight:500; }
 
-    #dp-log-count {
-      font-size: 10px; color: var(--dp-muted2); white-space: nowrap; font-weight: 500;
-    }
-
+    /* ── Logger table ── */
     #dp-log-table-wrap {
-      flex: 1; overflow-y: auto;
-      scrollbar-width: thin; scrollbar-color: var(--dp-border2) transparent;
+      flex:1; overflow-y:auto; min-height:0;
+      scrollbar-width:thin; scrollbar-color:var(--dp-border2) transparent;
     }
-    #dp-log-table-wrap::-webkit-scrollbar { width: 4px; }
-    #dp-log-table-wrap::-webkit-scrollbar-thumb { background: var(--dp-border2); border-radius: 2px; }
+    #dp-log-table-wrap::-webkit-scrollbar { width:4px; }
+    #dp-log-table-wrap::-webkit-scrollbar-thumb { background:var(--dp-border2); border-radius:2px; }
 
     #dp-log-table {
-      width: 100%; border-collapse: collapse;
-      font-size: 11px; font-family: var(--dp-font);
+      width:100%; border-collapse:collapse;
+      font-size:11px; font-family:var(--dp-font);
     }
     #dp-log-table thead th {
-      position: sticky; top: 0;
-      background: var(--dp-surface);
-      color: var(--dp-muted); font-weight: 600; font-size: 10px;
-      letter-spacing: .06em; text-align: left;
-      padding: 7px 12px; border-bottom: 1px solid var(--dp-border);
-      user-select: none;
+      position:sticky; top:0; background:var(--dp-surface);
+      color:var(--dp-muted); font-weight:600; font-size:10px; letter-spacing:.06em;
+      text-align:left; padding:6px 10px; border-bottom:1px solid var(--dp-border);
+      user-select:none; white-space:nowrap;
     }
-    #dp-log-table tbody tr {
-      border-bottom: 1px solid rgba(39,39,42,0.6);
-      transition: background .08s; cursor: pointer;
+    #dp-log-table tbody tr.dp-log-row {
+      border-bottom:1px solid rgba(39,39,42,0.5);
+      transition:background .07s; cursor:pointer;
     }
-    #dp-log-table tbody tr:hover { background: var(--dp-hover); }
-    #dp-log-table tbody td {
-      padding: 6px 12px; color: var(--dp-text); vertical-align: middle;
-      max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    .dp-td-method { width: 52px; }
-    .dp-td-status { width: 46px; }
-    .dp-td-src    { width: 46px; }
-    .dp-td-dur    { width: 56px; }
-    .dp-td-time   { width: 70px; }
+    #dp-log-table tbody tr.dp-log-row:hover { background:var(--dp-hover); }
+    #dp-log-table tbody td { padding:5px 10px; vertical-align:middle; max-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+    .dp-td-method { width:58px; }
+    .dp-td-status { width:44px; }
+    .dp-td-src    { width:44px; }
+    .dp-td-vid    { width:30px; text-align:center; }
     .dp-td-url    { }
+    .dp-td-dur    { width:60px; }
+    .dp-td-time   { width:68px; }
 
     .dp-method {
-      font-size: 9px; font-weight: 700; letter-spacing: .06em;
-      padding: 2px 6px; border-radius: 3px; border: 1px solid;
+      font-size:9px; font-weight:700; letter-spacing:.06em;
+      padding:2px 5px; border-radius:3px; border:1px solid;
     }
-    .dp-m-GET    { color: #86efac; border-color: rgba(134,239,172,.3); background: rgba(134,239,172,.07); }
-    .dp-m-POST   { color: #93c5fd; border-color: rgba(147,197,253,.3); background: rgba(147,197,253,.07); }
-    .dp-m-PUT    { color: #fcd34d; border-color: rgba(252,211,77,.3);  background: rgba(252,211,77,.07); }
-    .dp-m-DELETE { color: #f87171; border-color: rgba(248,113,113,.3); background: rgba(248,113,113,.07); }
-    .dp-m-PATCH  { color: #c4b5fd; border-color: rgba(196,181,253,.3); background: rgba(196,181,253,.07); }
-    .dp-m-other  { color: var(--dp-muted); border-color: var(--dp-border); background: transparent; }
+    .dp-m-GET    { color:#86efac; border-color:rgba(134,239,172,.3); background:rgba(134,239,172,.07); }
+    .dp-m-POST   { color:#93c5fd; border-color:rgba(147,197,253,.3); background:rgba(147,197,253,.07); }
+    .dp-m-PUT    { color:#fcd34d; border-color:rgba(252,211,77,.3);  background:rgba(252,211,77,.07);  }
+    .dp-m-DELETE { color:#f87171; border-color:rgba(248,113,113,.3); background:rgba(248,113,113,.07); }
+    .dp-m-PATCH  { color:#c4b5fd; border-color:rgba(196,181,253,.3); background:rgba(196,181,253,.07); }
+    .dp-m-OTHER  { color:var(--dp-muted); border-color:var(--dp-border); background:transparent; }
 
-    .dp-status-ok   { color: var(--dp-ok); }
-    .dp-status-redir { color: var(--dp-info); }
-    .dp-status-err  { color: var(--dp-err); }
-    .dp-status-pend { color: var(--dp-muted); }
+    .dp-status-ok   { color:var(--dp-ok); }
+    .dp-status-redir{ color:var(--dp-info); }
+    .dp-status-err  { color:var(--dp-err); }
+    .dp-status-pend { color:var(--dp-muted); }
 
-    .dp-dur { color: var(--dp-muted); }
-    .dp-dur.fast   { color: #86efac; }
-    .dp-dur.medium { color: #fcd34d; }
-    .dp-dur.slow   { color: #f87171; }
+    .dp-dur { color:var(--dp-muted); }
+    .dp-dur.fast   { color:#86efac; } .dp-dur.medium { color:#fcd34d; } .dp-dur.slow { color:#f87171; }
+    .dp-src-badge { font-size:9px; color:var(--dp-muted2); border:1px solid var(--dp-border); padding:1px 5px; border-radius:3px; }
 
-    .dp-src-badge {
-      font-size: 9px; color: var(--dp-muted2);
-      border: 1px solid var(--dp-border); padding: 1px 5px; border-radius: 3px;
+    /* yt-dlp video button in table */
+    .dp-vid-btn {
+      font-size:9px; padding:2px 6px; border-radius:3px; cursor:pointer;
+      font-family:var(--dp-font); font-weight:700; letter-spacing:.04em;
+      background:rgba(74,222,128,0.1); border:1px solid rgba(74,222,128,0.25);
+      color:var(--dp-ok); transition:all .1s; white-space:nowrap;
     }
+    .dp-vid-btn:hover { background:rgba(74,222,128,0.2); }
 
-    /* Row detail drawer */
-    .dp-row-detail {
-      background: var(--dp-dim); border-bottom: 1px solid var(--dp-border);
-    }
-    .dp-row-detail td { padding: 10px 14px; }
-    .dp-detail-url {
-      font-size: 10.5px; color: var(--dp-text); word-break: break-all;
-      line-height: 1.6; margin-bottom: 6px;
-    }
-    .dp-detail-meta {
-      display: flex; gap: 16px; flex-wrap: wrap;
-      font-size: 10px; color: var(--dp-muted);
-    }
-    .dp-detail-meta span b { color: var(--dp-text); font-weight: 500; }
-    .dp-detail-actions { display: flex; gap: 6px; margin-top: 8px; }
+    /* ── Detail rows ── */
+    tr.dp-row-detail { background:var(--dp-dim); border-bottom:1px solid var(--dp-border); }
+    tr.dp-row-detail td { padding:10px 14px; }
+    .dp-detail-inner { display:flex; flex-direction:column; gap:6px; }
+    .dp-detail-url { font-size:10.5px; color:var(--dp-text); word-break:break-all; line-height:1.6; }
+    .dp-detail-meta { display:flex; gap:14px; flex-wrap:wrap; font-size:10px; color:var(--dp-muted); }
+    .dp-detail-meta span b { color:var(--dp-text); font-weight:500; }
+    .dp-detail-actions { display:flex; gap:6px; flex-wrap:wrap; }
 
-    /* Empty */
-    .dp-empty {
-      text-align: center; padding: 40px 20px;
-      color: var(--dp-muted2); font-size: 11px; letter-spacing: .04em;
+    /* yt-dlp command box */
+    .dp-ytdlp-box {
+      display:none; background:var(--dp-bg);
+      border:1px solid rgba(74,222,128,0.2); border-radius:6px;
+      padding:10px 12px; margin-top:4px;
     }
-    .dp-empty-icon { font-size: 26px; display: block; margin-bottom: 8px; opacity: .4; }
+    .dp-ytdlp-box.show { display:block; }
+    .dp-ytdlp-code {
+      font-size:10px; color:var(--dp-ok); white-space:pre-wrap; word-break:break-all;
+      line-height:1.7; margin-bottom:6px; font-family:var(--dp-font);
+    }
+    .dp-ytdlp-meta { font-size:9px; color:var(--dp-muted); margin-bottom:8px; }
 
-    /* Mobile */
-    @media (max-width: 600px) {
-      #dp-panel { left: 8px; right: 8px; width: auto; bottom: 16px; height: min(580px, calc(100vh - 32px)); }
-      #dp-fab   { left: 16px; bottom: 16px; }
-      .dp-td-dur, .dp-td-time, .dp-td-src { display: none; }
+    /* Link check result */
+    .dp-check-result {
+      font-size:10px; font-family:var(--dp-font); padding:4px 0;
+      display:none;
+    }
+    .dp-check-result.checking { display:block; color:var(--dp-muted); }
+    .dp-check-result.ok       { display:block; color:var(--dp-ok); }
+    .dp-check-result.err      { display:block; color:var(--dp-err); }
+    .dp-check-result.warn     { display:block; color:var(--dp-warn); }
+
+    /* ── Empty ── */
+    .dp-empty { text-align:center; padding:40px 20px; color:var(--dp-muted2); font-size:11px; letter-spacing:.04em; }
+    .dp-empty-icon { font-size:26px; display:block; margin-bottom:8px; opacity:.4; }
+
+    /* ── Toast ── */
+    #dp-toast {
+      position:fixed; bottom:68px; left:20px;
+      background:var(--dp-text); color:var(--dp-bg);
+      font-family:var(--dp-font); font-size:11px; font-weight:600;
+      padding:6px 14px; border-radius:var(--dp-r);
+      z-index:2147483648; opacity:0; pointer-events:none;
+      transform:translateY(4px); transition:all .18s ease;
+    }
+    #dp-toast.show { opacity:1; transform:none; }
+
+    /* ── Mobile ── */
+    @media (max-width:600px) {
+      #dp-panel { left:6px !important; right:6px !important; width:auto !important; bottom:16px !important; min-width:unset; }
+      #dp-fab   { left:16px; bottom:16px; }
+      .dp-td-dur, .dp-td-time, .dp-td-src { display:none; }
     }
   `);
 
@@ -442,15 +502,32 @@
   function buildUI() {
     // FAB
     const fab = document.createElement('button');
-    fab.id = 'dp-fab';
+    fab.id    = 'dp-fab';
     fab.title = 'DevPanel';
     fab.textContent = '⌗';
     document.documentElement.appendChild(fab);
+    fab.addEventListener('click', togglePanel);
+
+    // Toast
+    const toast = document.createElement('div');
+    toast.id = 'dp-toast';
+    document.documentElement.appendChild(toast);
 
     // Panel
     const panel = document.createElement('div');
     panel.id = 'dp-panel';
     panel.innerHTML = `
+      <!-- Resize handles -->
+      <div class="dp-rz dp-rz-n"  data-rz="n"></div>
+      <div class="dp-rz dp-rz-s"  data-rz="s"></div>
+      <div class="dp-rz dp-rz-e"  data-rz="e"></div>
+      <div class="dp-rz dp-rz-w"  data-rz="w"></div>
+      <div class="dp-rz dp-rz-ne" data-rz="ne"></div>
+      <div class="dp-rz dp-rz-nw" data-rz="nw"></div>
+      <div class="dp-rz dp-rz-se" data-rz="se"></div>
+      <div class="dp-rz dp-rz-sw" data-rz="sw"></div>
+
+      <!-- Titlebar (drag) -->
       <div id="dp-titlebar">
         <div class="dp-dots">
           <div class="dp-dot dp-dot-r"></div>
@@ -461,6 +538,7 @@
         <button class="dp-close" id="dp-close">✕</button>
       </div>
 
+      <!-- Main tabs -->
       <div id="dp-tabs">
         <button class="dp-tab active" data-tab="executor">Executor</button>
         <button class="dp-tab" data-tab="logger">Network</button>
@@ -468,24 +546,30 @@
 
       <!-- ─ EXECUTOR ─ -->
       <div id="dp-executor" class="active">
-        <div id="dp-exec-header">
+        <div id="dp-exec-tabs-bar">
+          <!-- exec tabs injected by JS -->
+          <button id="dp-new-tab-btn" title="New tab">+</button>
+        </div>
+        <div id="dp-exec-toolbar">
           <span class="dp-badge">JS</span>
-          <span class="dp-badge" id="dp-exec-ctx">window</span>
+          <span class="dp-badge">unsafeWindow</span>
+          <span class="dp-badge">GM_xmlhttpRequest</span>
           <div id="dp-exec-actions">
+            <button class="dp-btn dp-btn-ghost" id="dp-hist-prev" title="Prev history (Alt+↑)">↑</button>
+            <button class="dp-btn dp-btn-ghost" id="dp-hist-next" title="Next history (Alt+↓)">↓</button>
             <button class="dp-btn dp-btn-ghost" id="dp-clear-code">Clear</button>
-            <button class="dp-btn dp-btn-ghost" id="dp-hist-prev" title="Previous (↑)">↑</button>
-            <button class="dp-btn dp-btn-ghost" id="dp-hist-next" title="Next (↓)">↓</button>
+            <button class="dp-btn dp-btn-ghost" id="dp-clear-output" style="color:var(--dp-muted2)">Clear out</button>
             <button class="dp-btn dp-btn-primary" id="dp-run">▶ Run</button>
           </div>
         </div>
-        <div id="dp-exec-editor-wrap">
+        <div id="dp-editor-area">
           <div id="dp-gutter"></div>
-          <textarea id="dp-textarea" spellcheck="false" placeholder="// JavaScript — runs in page context&#10;// console.log, fetch, document, unsafeWindow all available&#10;&#10;document.title"></textarea>
+          <textarea id="dp-textarea" spellcheck="false"
+            placeholder="// Full userscript-level access&#10;// unsafeWindow, GM_xmlhttpRequest, fetch, document…&#10;// Ctrl+Enter to run · Alt+↑↓ for history&#10;&#10;console.log(document.title)"></textarea>
         </div>
         <div id="dp-output-wrap">
           <div id="dp-output-header">
             <span id="dp-output-title">OUTPUT</span>
-            <button class="dp-btn dp-btn-ghost dp-output-clear" id="dp-clear-output" style="padding:2px 8px;font-size:9px">Clear</button>
           </div>
           <div id="dp-output"></div>
         </div>
@@ -496,16 +580,17 @@
         <div id="dp-log-toolbar">
           <div id="dp-search-wrap">
             <span id="dp-search-icon">⌕</span>
-            <input id="dp-search" type="text" placeholder="Filter by URL, method, status…" autocomplete="off" spellcheck="false"/>
+            <input id="dp-search" type="text" placeholder="Filter by URL, method, status, type…" autocomplete="off" spellcheck="false"/>
           </div>
           <div class="dp-method-filter">
             <button class="dp-mf-btn active" data-mf="ALL">ALL</button>
             <button class="dp-mf-btn" data-mf="GET">GET</button>
             <button class="dp-mf-btn" data-mf="POST">POST</button>
             <button class="dp-mf-btn" data-mf="XHR">XHR</button>
+            <button class="dp-mf-btn" data-mf="VIDEO">VIDEO</button>
           </div>
           <span id="dp-log-count">0 reqs</span>
-          <button class="dp-btn dp-btn-ghost" id="dp-clear-log" style="padding:3px 9px;font-size:9px">Clear</button>
+          <button class="dp-btn dp-btn-ghost" id="dp-clear-log" style="padding:3px 8px;font-size:9px">Clear</button>
         </div>
         <div id="dp-log-table-wrap">
           <table id="dp-log-table">
@@ -514,9 +599,10 @@
                 <th class="dp-td-method">Method</th>
                 <th class="dp-td-status">Status</th>
                 <th class="dp-td-src">Src</th>
+                <th class="dp-td-vid">▼</th>
                 <th class="dp-td-url">URL</th>
-                <th class="dp-td-dur">Time</th>
-                <th class="dp-td-time">At</th>
+                <th class="dp-td-dur">ms</th>
+                <th class="dp-td-time">Time</th>
               </tr>
             </thead>
             <tbody id="dp-log-tbody"></tbody>
@@ -526,173 +612,318 @@
     `;
     document.documentElement.appendChild(panel);
 
-    // Wire up events
-    fab.addEventListener('click', togglePanel);
+    applyPanelGeometry();
+
+    // Resize & drag
+    setupResizeDrag(panel);
+
+    // Close
     panel.querySelector('#dp-close').addEventListener('click', () => setOpen(false));
-    panel.querySelectorAll('.dp-tab').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
+    // Main tabs
+    panel.querySelectorAll('.dp-tab').forEach(b =>
+      b.addEventListener('click', () => switchMainTab(b.dataset.tab))
+    );
+
+    // Executor
     panel.querySelector('#dp-run').addEventListener('click', runCode);
-    panel.querySelector('#dp-clear-code').addEventListener('click', () => { document.getElementById('dp-textarea').value = ''; updateGutter(); });
-    panel.querySelector('#dp-clear-output').addEventListener('click', clearOutput);
-    panel.querySelector('#dp-clear-log').addEventListener('click', () => { state.logs = []; renderLogger(); });
-    panel.querySelector('#dp-search').addEventListener('input', e => { state.filter = e.target.value; renderLogger(); });
+    panel.querySelector('#dp-clear-code').addEventListener('click', () => {
+      const ta = document.getElementById('dp-textarea');
+      if (ta) { ta.value = ''; getActiveExecTab().code = ''; updateGutter(); }
+    });
+    panel.querySelector('#dp-clear-output').addEventListener('click', () => {
+      const out = document.getElementById('dp-output');
+      if (out) out.innerHTML = '';
+    });
     panel.querySelector('#dp-hist-prev').addEventListener('click', histPrev);
     panel.querySelector('#dp-hist-next').addEventListener('click', histNext);
+    panel.querySelector('#dp-new-tab-btn').addEventListener('click', newExecTab);
 
+    const ta = panel.querySelector('#dp-textarea');
+    ta.addEventListener('keydown', e => {
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const s = ta.selectionStart, en = ta.selectionEnd;
+        ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(en);
+        ta.selectionStart = ta.selectionEnd = s + 2;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); runCode(); }
+      if (e.altKey && e.key === 'ArrowUp')   { e.preventDefault(); histPrev(); }
+      if (e.altKey && e.key === 'ArrowDown') { e.preventDefault(); histNext(); }
+    });
+    ta.addEventListener('input', () => { getActiveExecTab().code = ta.value; updateGutter(); });
+    ta.addEventListener('scroll', () => {
+      const g = document.getElementById('dp-gutter');
+      if (g) g.scrollTop = ta.scrollTop;
+    });
+
+    // Logger
+    panel.querySelector('#dp-search').addEventListener('input', e => {
+      state.filter = e.target.value;
+      renderLoggerFull();
+    });
+    panel.querySelector('#dp-clear-log').addEventListener('click', () => {
+      state.logs = [];
+      _detailOpen.clear();
+      renderLoggerFull();
+    });
     panel.querySelectorAll('.dp-mf-btn').forEach(b => {
       b.addEventListener('click', () => {
         panel.querySelectorAll('.dp-mf-btn').forEach(x => x.classList.remove('active'));
         b.classList.add('active');
         state.methodFilter = b.dataset.mf;
-        renderLogger();
+        renderLoggerFull();
       });
     });
-    state.methodFilter = 'ALL';
 
-    // Textarea: tab key, gutter sync
-    const ta = panel.querySelector('#dp-textarea');
-    ta.addEventListener('keydown', e => {
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        const s = ta.selectionStart, end = ta.selectionEnd;
-        ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(end);
-        ta.selectionStart = ta.selectionEnd = s + 2;
-      }
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runCode(); }
-      if (e.key === 'ArrowUp' && e.altKey) { e.preventDefault(); histPrev(); }
-      if (e.key === 'ArrowDown' && e.altKey) { e.preventDefault(); histNext(); }
-    });
-    ta.addEventListener('input', updateGutter);
-    ta.addEventListener('scroll', syncGutterScroll);
+    renderExecTabs();
     updateGutter();
+  }
+
+  // ─── Panel geometry ───────────────────────────────────────────────────────────
+  function applyPanelGeometry() {
+    const p = document.getElementById('dp-panel');
+    if (!p) return;
+    const maxW = window.innerWidth  - state.panelL - 10;
+    const maxH = window.innerHeight - state.panelB - 10;
+    const w = Math.min(state.panelW, maxW);
+    const h = Math.min(state.panelH, maxH);
+    const l = Math.max(0, Math.min(state.panelL, window.innerWidth  - w));
+    const b = Math.max(0, Math.min(state.panelB, window.innerHeight - h));
+    p.style.width  = w + 'px';
+    p.style.height = h + 'px';
+    p.style.left   = l + 'px';
+    p.style.bottom = b + 'px';
+  }
+
+  // ─── Resize & drag ────────────────────────────────────────────────────────────
+  function setupResizeDrag(panel) {
+    let mode = null, startX = 0, startY = 0, startW = 0, startH = 0, startL = 0, startB = 0;
+    const MIN_W = 400, MIN_H = 280;
+
+    const onDown = (e, m) => {
+      if (e.button !== 0) return;
+      mode   = m;
+      startX = e.clientX; startY = e.clientY;
+      startW = panel.offsetWidth;  startH = panel.offsetHeight;
+      startL = panel.offsetLeft;
+      startB = parseInt(panel.style.bottom) || state.panelB;
+      panel.classList.add('resizing');
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.preventDefault();
+    };
+
+    const onMove = (e) => {
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      let w = startW, h = startH, l = startL, b = startB;
+
+      if (mode === 'drag') {
+        l = startL + dx;
+        b = startB - dy;
+      } else {
+        if (mode.includes('e')) w = Math.max(MIN_W, startW + dx);
+        if (mode.includes('w')) { w = Math.max(MIN_W, startW - dx); l = startL + (startW - w); }
+        if (mode.includes('s')) h = Math.max(MIN_H, startH + dy);  // s = drag down = bigger
+        if (mode.includes('n')) { h = Math.max(MIN_H, startH - dy); b = startB + (startH - h); }
+      }
+
+      // Clamp to viewport
+      l = Math.max(0, Math.min(l, window.innerWidth  - w));
+      b = Math.max(0, Math.min(b, window.innerHeight - h));
+
+      panel.style.width  = w + 'px';
+      panel.style.height = h + 'px';
+      panel.style.left   = l + 'px';
+      panel.style.bottom = b + 'px';
+
+      state.panelW = w; state.panelH = h;
+      state.panelL = l; state.panelB = b;
+    };
+
+    const onUp = () => {
+      mode = null;
+      panel.classList.remove('resizing');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+
+    // Resize handles
+    panel.querySelectorAll('.dp-rz').forEach(el => {
+      el.addEventListener('mousedown', e => onDown(e, el.dataset.rz));
+    });
+
+    // Drag via titlebar
+    const titlebar = panel.querySelector('#dp-titlebar');
+    titlebar.addEventListener('mousedown', e => {
+      if (e.target.classList.contains('dp-close')) return;
+      onDown(e, 'drag');
+    });
+
+    // Touch drag (mobile)
+    let touchStartX = 0, touchStartY = 0, touchL = 0, touchB = 0;
+    titlebar.addEventListener('touchstart', e => {
+      const t = e.touches[0];
+      touchStartX = t.clientX; touchStartY = t.clientY;
+      touchL = panel.offsetLeft;
+      touchB = parseInt(panel.style.bottom) || state.panelB;
+    }, { passive: true });
+    titlebar.addEventListener('touchmove', e => {
+      const t = e.touches[0];
+      const l = Math.max(0, touchL + (t.clientX - touchStartX));
+      const b = Math.max(0, touchB - (t.clientY - touchStartY));
+      panel.style.left   = Math.min(l, window.innerWidth  - panel.offsetWidth)  + 'px';
+      panel.style.bottom = Math.min(b, window.innerHeight - panel.offsetHeight) + 'px';
+    }, { passive: true });
+  }
+
+  // ─── Exec tabs ───────────────────────────────────────────────────────────────
+  function getActiveExecTab() {
+    return state.execTabs.find(t => t.id === state.activeExecTab) || state.execTabs[0];
+  }
+
+  function renderExecTabs() {
+    const bar = document.getElementById('dp-exec-tabs-bar');
+    if (!bar) return;
+    const plusBtn = bar.querySelector('#dp-new-tab-btn');
+    // Remove old tab buttons
+    bar.querySelectorAll('.dp-exec-tab').forEach(el => el.remove());
+
+    state.execTabs.forEach(tab => {
+      const btn = document.createElement('button');
+      btn.className = 'dp-exec-tab' + (tab.id === state.activeExecTab ? ' active' : '');
+      btn.dataset.tabId = tab.id;
+      btn.innerHTML = `<span class="dp-exec-tab-label">${escHtml(tab.title)}</span>${
+        state.execTabs.length > 1
+          ? `<span class="dp-exec-tab-close" data-close="${tab.id}">✕</span>`
+          : ''
+      }`;
+      btn.addEventListener('click', e => {
+        if (e.target.dataset.close) return;
+        switchExecTab(tab.id);
+      });
+      const closeEl = btn.querySelector('[data-close]');
+      if (closeEl) closeEl.addEventListener('click', e => { e.stopPropagation(); closeExecTab(tab.id); });
+      bar.insertBefore(btn, plusBtn);
+    });
+  }
+
+  function switchExecTab(id) {
+    // Save current code
+    const cur = getActiveExecTab();
+    const ta  = document.getElementById('dp-textarea');
+    if (ta && cur) cur.code = ta.value;
+
+    state.activeExecTab = id;
+    const next = getActiveExecTab();
+    if (ta && next) { ta.value = next.code || ''; updateGutter(); }
+    renderExecTabs();
+  }
+
+  function newExecTab() {
+    const id   = ++state.execTabId;
+    const tab  = { id, title: `Tab ${id}`, code: '' };
+    state.execTabs.push(tab);
+    switchExecTab(id);
+  }
+
+  function closeExecTab(id) {
+    if (state.execTabs.length <= 1) return;
+    const idx  = state.execTabs.findIndex(t => t.id === id);
+    state.execTabs.splice(idx, 1);
+    if (state.activeExecTab === id) {
+      const next = state.execTabs[Math.min(idx, state.execTabs.length - 1)];
+      state.activeExecTab = next.id;
+      const ta = document.getElementById('dp-textarea');
+      if (ta) { ta.value = next.code || ''; updateGutter(); }
+    }
+    renderExecTabs();
   }
 
   // ─── Gutter ──────────────────────────────────────────────────────────────────
   function updateGutter() {
-    const ta    = document.getElementById('dp-textarea');
-    const gutter= document.getElementById('dp-gutter');
-    if (!ta || !gutter) return;
+    const ta = document.getElementById('dp-textarea');
+    const g  = document.getElementById('dp-gutter');
+    if (!ta || !g) return;
     const lines = ta.value.split('\n').length;
     let html = '';
-    for (let i = 1; i <= Math.max(lines, 1); i++) {
-      html += `<span class="dp-lnum">${i}</span>`;
-    }
-    gutter.innerHTML = html;
+    for (let i = 1; i <= Math.max(lines, 1); i++) html += `<span class="dp-lnum">${i}</span>`;
+    g.innerHTML = html;
   }
 
-  function syncGutterScroll() {
-    const ta     = document.getElementById('dp-textarea');
-    const gutter = document.getElementById('dp-gutter');
-    if (ta && gutter) gutter.scrollTop = ta.scrollTop;
-  }
-
-  // ─── Code execution ──────────────────────────────────────────────────────────
+  // ─── Code execution (userscript-level scope) ─────────────────────────────────
   function runCode() {
     const ta   = document.getElementById('dp-textarea');
-    const code = ta.value.trim();
+    const code = ta?.value?.trim();
     if (!code) return;
 
-    // Save to history
-    if (state.history[0] !== code) {
-      state.history.unshift(code);
-      if (state.history.length > 50) state.history.pop();
-    }
+    // History
+    if (state.history[0] !== code) { state.history.unshift(code); if (state.history.length > 50) state.history.pop(); }
     state.histIdx = -1;
 
-    // Patch console to capture output
     const captured = [];
-    const patch    = (level) => (...args) => {
-      captured.push({ level, text: args.map(safeStr).join(' '), ts: Date.now() });
-      unsafeWindow.console[level]?.apply(unsafeWindow.console, args);
-    };
+    const ts = () => new Date().toLocaleTimeString([], { hour12: false });
 
     const fakeConsole = {
-      log:   patch('log'),
-      info:  patch('info'),
-      warn:  patch('warn'),
-      error: patch('error'),
-      dir:   patch('log'),
+      log:   (...a) => { captured.push({ level:'log',   text: a.map(safeStr).join(' '), t: ts() }); unsafeWindow.console.log?.(...a); },
+      info:  (...a) => { captured.push({ level:'info',  text: a.map(safeStr).join(' '), t: ts() }); unsafeWindow.console.info?.(...a); },
+      warn:  (...a) => { captured.push({ level:'warn',  text: a.map(safeStr).join(' '), t: ts() }); unsafeWindow.console.warn?.(...a); },
+      error: (...a) => { captured.push({ level:'error', text: a.map(safeStr).join(' '), t: ts() }); unsafeWindow.console.error?.(...a); },
+      dir:   (...a) => { captured.push({ level:'log',   text: a.map(safeStr).join(' '), t: ts() }); },
+      __ret: (v)    => { captured.push({ level:'ret',   text: safeStr(v), t: ts() }); },
     };
 
-    let ret, hasRet = false, errored = false;
+    // Execute with full userscript-level access:
+    // - unsafeWindow (page's window)
+    // - GM_xmlhttpRequest (cross-origin requests)
+    // - _origFetch (unwrapped fetch, bypasses our hook)
+    // - document, location all from page scope
     try {
-      // Build function with patched console in scope
-      const fn = new Function('console', 'window', `
-        "use strict";
+      const fn = new Function(
+        'console', 'window', 'unsafeWindow', 'GM_xmlhttpRequest', 'GM_setClipboard', 'fetch', '__ret',
+        `"use strict";
         try {
-          const __r = (function() { ${code} })();
-          if (typeof __r !== 'undefined') { console.__ret(__r); }
-        } catch(e) { console.error(e.message || String(e)); }
-      `);
-
-      fakeConsole.__ret = (v) => { captured.push({ level: 'ret', text: safeStr(v), ts: Date.now() }); };
-
-      fn(fakeConsole, unsafeWindow);
+          const __r = (function() {
+            ${code}
+          })();
+          if (typeof __r !== 'undefined') __ret(__r);
+        } catch(e) { console.error(e.message || String(e)); }`
+      );
+      fn(fakeConsole, unsafeWindow, unsafeWindow, GM_xmlhttpRequest, GM_setClipboard, _origFetch, fakeConsole.__ret);
     } catch (e) {
-      captured.push({ level: 'error', text: e.message || String(e), ts: Date.now() });
+      captured.push({ level: 'error', text: e.message || String(e), t: ts() });
     }
 
-    // Flush to output panel
     const out = document.getElementById('dp-output');
     if (!out) return;
-    const ts0 = captured[0]?.ts;
-    captured.forEach(({ level, text, ts }) => {
+    if (captured.length === 0) {
+      captured.push({ level: 'ret', text: 'undefined', t: ts() });
+    }
+    captured.forEach(({ level, text, t }) => {
       const line = document.createElement('div');
       line.className = `dp-out-line dp-out-${level}`;
-      const tStr = new Date(ts).toLocaleTimeString([], { hour12: false });
-      line.innerHTML = `<span class="dp-out-ts">${tStr}</span>${escHtml(text)}`;
+      line.innerHTML = `<span class="dp-out-ts">${t}</span>${escHtml(text)}`;
       out.appendChild(line);
     });
-    if (captured.length === 0) {
-      const line = document.createElement('div');
-      line.className = 'dp-out-line dp-out-ret';
-      line.textContent = 'undefined';
-      out.appendChild(line);
-    }
     out.scrollTop = out.scrollHeight;
   }
 
-  function clearOutput() {
-    const out = document.getElementById('dp-output');
-    if (out) out.innerHTML = '';
-  }
-
-  function safeStr(v) {
-    if (v === null) return 'null';
-    if (v === undefined) return 'undefined';
-    if (typeof v === 'string') return v;
-    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-    try { return JSON.stringify(v, null, 2); } catch { return String(v); }
-  }
-
-  // ─── Code history ─────────────────────────────────────────────────────────────
+  // ─── History ─────────────────────────────────────────────────────────────────
   function histPrev() {
-    if (state.history.length === 0) return;
+    if (!state.history.length) return;
     state.histIdx = Math.min(state.histIdx + 1, state.history.length - 1);
     const ta = document.getElementById('dp-textarea');
-    if (ta) { ta.value = state.history[state.histIdx]; updateGutter(); }
+    if (ta) { ta.value = state.history[state.histIdx]; getActiveExecTab().code = ta.value; updateGutter(); }
   }
   function histNext() {
     state.histIdx = Math.max(state.histIdx - 1, -1);
     const ta = document.getElementById('dp-textarea');
-    if (ta) { ta.value = state.histIdx === -1 ? '' : state.history[state.histIdx]; updateGutter(); }
+    if (ta) { ta.value = state.histIdx === -1 ? '' : state.history[state.histIdx]; getActiveExecTab().code = ta.value; updateGutter(); }
   }
 
-  // ─── Logger render ────────────────────────────────────────────────────────────
-  let _openRow = null;
-
-  function filteredLogs() {
-    const q  = state.filter.toLowerCase().trim();
-    const mf = state.methodFilter || 'ALL';
-    return state.logs.filter(l => {
-      const matchQ  = !q || l.url.toLowerCase().includes(q) || String(l.status).includes(q) || l.method.toLowerCase().includes(q) || l.type.toLowerCase().includes(q);
-      const matchMF = mf === 'ALL' ? true
-                    : mf === 'XHR' ? l.src === 'XHR'
-                    : l.method === mf;
-      return matchQ && matchMF;
-    });
-  }
-
-  function renderLogger() {
+  // ─── Logger: full re-render (used on filter change / tab switch / clear) ─────
+  function renderLoggerFull() {
     const tbody = document.getElementById('dp-log-tbody');
     const count = document.getElementById('dp-log-count');
     if (!tbody) return;
@@ -700,140 +931,267 @@
     const logs = filteredLogs();
     if (count) count.textContent = `${logs.length} req${logs.length !== 1 ? 's' : ''}`;
 
+    // Remove all rows BUT keep detail rows whose IDs are in _detailOpen
+    tbody.innerHTML = '';
+
     if (logs.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="6"><div class="dp-empty"><span class="dp-empty-icon">◎</span>No requests matched.</div></td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7"><div class="dp-empty"><span class="dp-empty-icon">◎</span>No requests matched.</div></td></tr>`;
       return;
     }
 
-    tbody.innerHTML = '';
     logs.forEach(log => {
-      const row = document.createElement('tr');
-      row.dataset.lid = log.id;
-
-      const mCls  = `dp-m-${['GET','POST','PUT','DELETE','PATCH'].includes(log.method) ? log.method : 'other'}`;
-      const sCls  = log.status >= 200 && log.status < 300 ? 'dp-status-ok'
-                  : log.status >= 300 && log.status < 400 ? 'dp-status-redir'
-                  : log.status >= 400 ? 'dp-status-err'
-                  : 'dp-status-pend';
-      const durCls = log.duration < 100 ? 'fast' : log.duration < 500 ? 'medium' : 'slow';
-      const time  = new Date(log.ts).toLocaleTimeString([], { hour12: false });
-      const urlShort = (() => {
-        try { const u = new URL(log.url); return u.pathname + (u.search.length > 30 ? u.search.slice(0,30)+'…' : u.search); }
-        catch { return log.url.slice(0, 60); }
-      })();
-
-      row.innerHTML = `
-        <td class="dp-td-method"><span class="dp-method ${mCls}">${log.method}</span></td>
-        <td class="dp-td-status ${sCls}">${log.status || '—'}</td>
-        <td class="dp-td-src"><span class="dp-src-badge">${log.src}</span></td>
-        <td class="dp-td-url" title="${escHtml(log.url)}">${escHtml(urlShort)}</td>
-        <td class="dp-td-dur"><span class="dp-dur ${durCls}">${log.duration}ms</span></td>
-        <td class="dp-td-time">${time}</td>
-      `;
-
-      row.addEventListener('click', () => toggleDetail(row, log, tbody));
+      const row = buildLogRow(log);
       tbody.appendChild(row);
+      // Re-attach open detail rows
+      if (_detailOpen.has(log.id)) {
+        const detail = buildDetailRow(log);
+        tbody.appendChild(detail);
+      }
     });
   }
 
-  function toggleDetail(row, log, tbody) {
-    // Remove existing detail if open
-    const existing = tbody.querySelector('.dp-row-detail');
-    if (existing) {
-      const wasThis = existing.dataset.forId === String(log.id);
-      existing.remove();
-      _openRow = null;
-      if (wasThis) return;
+  // ─── Logger: prepend single new row (live append without re-render) ───────────
+  function prependLogRow(log) {
+    const tbody = document.getElementById('dp-log-tbody');
+    const count = document.getElementById('dp-log-count');
+    if (!tbody) return;
+
+    // Remove empty-state row if present
+    const empty = tbody.querySelector('td[colspan]');
+    if (empty) tbody.innerHTML = '';
+
+    if (!matchesFilter(log)) {
+      if (count) count.textContent = `${filteredLogs().length} req${filteredLogs().length !== 1 ? 's' : ''}`;
+      return;
     }
 
+    const row = buildLogRow(log);
+    tbody.insertBefore(row, tbody.firstChild);
+    if (count) count.textContent = `${filteredLogs().length} req${filteredLogs().length !== 1 ? 's' : ''}`;
+  }
+
+  // ─── Filter helpers ───────────────────────────────────────────────────────────
+  function matchesFilter(log) {
+    const q   = state.filter.toLowerCase().trim();
+    const mf  = state.methodFilter || 'ALL';
+    const isV = VIDEO_EXT.test(log.url);
+    const matchQ  = !q || log.url.toLowerCase().includes(q) || String(log.status).includes(q)
+                    || log.method.toLowerCase().includes(q) || log.type.toLowerCase().includes(q);
+    const matchMF = mf === 'ALL'   ? true
+                  : mf === 'XHR'   ? log.src === 'XHR'
+                  : mf === 'VIDEO' ? isV
+                  : log.method === mf;
+    return matchQ && matchMF;
+  }
+
+  function filteredLogs() {
+    return state.logs.filter(matchesFilter);
+  }
+
+  // ─── Build a log row <tr> ────────────────────────────────────────────────────
+  function buildLogRow(log) {
+    const isVideo = VIDEO_EXT.test(log.url);
+    const mKey    = ['GET','POST','PUT','DELETE','PATCH'].includes(log.method) ? log.method : 'OTHER';
+    const mCls    = `dp-m-${mKey}`;
+    const sCls    = log.status >= 200 && log.status < 300 ? 'dp-status-ok'
+                  : log.status >= 300 && log.status < 400 ? 'dp-status-redir'
+                  : log.status >= 400 ? 'dp-status-err' : 'dp-status-pend';
+    const durCls  = log.duration < 100 ? 'fast' : log.duration < 500 ? 'medium' : 'slow';
+    const time    = new Date(log.ts).toLocaleTimeString([], { hour12: false });
+    const urlShort = (() => {
+      try {
+        const u = new URL(log.url);
+        const p = u.pathname + (u.search ? u.search.slice(0, 22) + (u.search.length > 22 ? '…' : '') : '');
+        return p;
+      } catch { return log.url.slice(0, 50); }
+    })();
+
+    const row = document.createElement('tr');
+    row.className   = 'dp-log-row';
+    row.dataset.lid = log.id;
+    row.innerHTML = `
+      <td class="dp-td-method"><span class="dp-method ${mCls}">${log.method}</span></td>
+      <td class="dp-td-status ${sCls}">${log.status || '—'}</td>
+      <td class="dp-td-src"><span class="dp-src-badge">${log.src}</span></td>
+      <td class="dp-td-vid">${isVideo ? `<button class="dp-vid-btn" title="yt-dlp command">▼</button>` : ''}</td>
+      <td class="dp-td-url" title="${escHtml(log.url)}">${escHtml(urlShort)}</td>
+      <td class="dp-td-dur"><span class="dp-dur ${durCls}">${log.duration}ms</span></td>
+      <td class="dp-td-time">${time}</td>
+    `;
+
+    if (isVideo) {
+      row.querySelector('.dp-vid-btn').addEventListener('click', e => {
+        e.stopPropagation();
+        toggleDetail(log, row);
+        // Also open the ytdlp box
+        setTimeout(() => {
+          const box = document.querySelector(`.dp-ytdlp-box[data-for-vid="${log.id}"]`);
+          if (box && !box.classList.contains('show')) box.classList.add('show');
+        }, 10);
+      });
+    }
+
+    row.addEventListener('click', () => toggleDetail(log, row));
+    return row;
+  }
+
+  // ─── Build a detail <tr> ─────────────────────────────────────────────────────
+  function buildDetailRow(log) {
+    const isVideo = VIDEO_EXT.test(log.url);
+    const cmd     = isVideo ? buildYtdlpCmd(log.url) : '';
+    const cookies = getSiteCookies();
+    const cookieCnt = cookies ? cookies.split(';').length : 0;
+
     const detail = document.createElement('tr');
-    detail.className = 'dp-row-detail';
-    detail.dataset.forId = String(log.id);
+    detail.className   = 'dp-row-detail';
+    detail.dataset.forLog = String(log.id);
     detail.innerHTML = `
-      <td colspan="6">
-        <div class="dp-detail-url">${escHtml(log.url)}</div>
-        <div class="dp-detail-meta">
-          <span>Method <b>${log.method}</b></span>
-          <span>Status <b>${log.status || '—'}</b></span>
-          <span>Type <b>${log.type}</b></span>
-          <span>Duration <b>${log.duration}ms</b></span>
-          <span>Size <b>${log.size} bytes</b></span>
-          <span>Source <b>${log.src}</b></span>
-        </div>
-        <div class="dp-detail-actions">
-          <button class="dp-btn dp-btn-ghost" style="font-size:9px;padding:3px 9px" data-copy-url>⧉ Copy URL</button>
-          <button class="dp-btn dp-btn-ghost" style="font-size:9px;padding:3px 9px" data-inject>→ Inject to executor</button>
+      <td colspan="7">
+        <div class="dp-detail-inner">
+          <div class="dp-detail-url">${escHtml(log.url)}</div>
+          <div class="dp-detail-meta">
+            <span>Method <b>${log.method}</b></span>
+            <span>Status <b>${log.status || '—'}</b></span>
+            <span>Type <b>${log.type}</b></span>
+            <span>Duration <b>${log.duration}ms</b></span>
+            <span>Size <b>${log.size}B</b></span>
+            <span>Src <b>${log.src}</b></span>
+          </div>
+          <div class="dp-detail-actions">
+            <button class="dp-btn dp-btn-ghost" style="font-size:9px;padding:3px 9px" data-act="copy-url">⧉ URL</button>
+            <button class="dp-btn dp-btn-ghost" style="font-size:9px;padding:3px 9px" data-act="inject">→ Executor</button>
+            ${isVideo ? `<button class="dp-btn dp-btn-ghost" style="font-size:9px;padding:3px 9px;color:var(--dp-ok);border-color:rgba(74,222,128,0.3)" data-act="ytdlp">▼ yt-dlp</button>` : ''}
+            <button class="dp-btn dp-btn-ghost" style="font-size:9px;padding:3px 9px;color:var(--dp-info);border-color:rgba(96,165,250,0.3)" data-act="check">⬡ Check link</button>
+          </div>
+          ${isVideo ? `
+          <div class="dp-ytdlp-box" data-for-vid="${log.id}">
+            <div class="dp-ytdlp-code">${escHtml(cmd)}</div>
+            <div class="dp-ytdlp-meta">${
+              cookieCnt > 0
+                ? `🍪 ${cookieCnt} cookie(s) from ${location.hostname} injected`
+                : `⚠ No cookies found for ${location.hostname}`
+            }</div>
+            <div style="display:flex;gap:6px">
+              <button class="dp-btn dp-btn-ghost" style="font-size:9px;padding:3px 9px" data-act="copy-cmd">⧉ Copy command</button>
+              <button class="dp-btn dp-btn-ghost" style="font-size:9px;padding:3px 9px" data-act="copy-url-only">⧉ Copy URL</button>
+            </div>
+          </div>` : ''}
+          <div class="dp-check-result" data-check-id="${log.id}"></div>
         </div>
       </td>`;
 
-    detail.querySelector('[data-copy-url]').addEventListener('click', () => {
-      GM_setClipboard(log.url);
-      showToast('URL copied');
-    });
-    detail.querySelector('[data-inject]').addEventListener('click', () => {
-      const ta   = document.getElementById('dp-textarea');
+    detail.querySelector('[data-act="copy-url"]')?.addEventListener('click', () => { GM_setClipboard(log.url); showToast('URL copied'); });
+    detail.querySelector('[data-act="inject"]')?.addEventListener('click', () => {
       const code = `fetch("${log.url}", { method: "${log.method}" })\n  .then(r => r.json())\n  .then(d => console.log(d))\n  .catch(e => console.error(e));`;
-      if (ta) { ta.value = code; updateGutter(); switchTab('executor'); }
+      const ta = document.getElementById('dp-textarea');
+      if (ta) { ta.value = code; getActiveExecTab().code = code; updateGutter(); switchMainTab('executor'); }
     });
+    detail.querySelector('[data-act="ytdlp"]')?.addEventListener('click', () => {
+      const box = detail.querySelector(`.dp-ytdlp-box[data-for-vid="${log.id}"]`);
+      if (box) box.classList.toggle('show');
+    });
+    detail.querySelector('[data-act="copy-cmd"]')?.addEventListener('click', () => { GM_setClipboard(cmd); showToast('Command copied!'); });
+    detail.querySelector('[data-act="copy-url-only"]')?.addEventListener('click', () => { GM_setClipboard(log.url); showToast('URL copied'); });
+    detail.querySelector('[data-act="check"]')?.addEventListener('click', () => checkLink(log.url, log.id));
 
-    row.insertAdjacentElement('afterend', detail);
-    _openRow = log.id;
+    return detail;
   }
 
-  // ─── Panel / tab logic ────────────────────────────────────────────────────────
+  // ─── Toggle detail (persistent — stays open when new rows added) ─────────────
+  function toggleDetail(log, row) {
+    const tbody = document.getElementById('dp-log-tbody');
+    if (!tbody) return;
+
+    const existing = tbody.querySelector(`.dp-row-detail[data-for-log="${log.id}"]`);
+    if (existing) {
+      // Toggle visibility, don't remove
+      const isHidden = existing.style.display === 'none';
+      existing.style.display = isHidden ? '' : 'none';
+      if (isHidden) _detailOpen.add(log.id);
+      else          _detailOpen.delete(log.id);
+    } else {
+      const detail = buildDetailRow(log);
+      // Insert after the row (which may not be directly after if row was at top)
+      row.insertAdjacentElement('afterend', detail);
+      _detailOpen.add(log.id);
+    }
+  }
+
+  // ─── Link checker (userscript-level cross-origin HEAD request) ───────────────
+  function checkLink(url, logId) {
+    const el = document.querySelector(`.dp-check-result[data-check-id="${logId}"]`);
+    if (!el) return;
+    el.className  = 'dp-check-result checking';
+    el.textContent = '⟳ Checking…';
+
+    GM_xmlhttpRequest({
+      method: 'HEAD',
+      url,
+      headers: {
+        'Referer':        location.href,
+        'Origin':         location.origin,
+        'User-Agent':     navigator.userAgent,
+      },
+      onload(res) {
+        const ct = (res.responseHeaders?.match(/content-type:\s*([^\r\n]+)/i)?.[1] || '').trim() || '—';
+        const cl = res.responseHeaders?.match(/content-length:\s*(\d+)/i)?.[1];
+        if (res.status >= 200 && res.status < 400) {
+          el.className  = 'dp-check-result ok';
+          el.textContent = `✓ ${res.status} OK — ${ct}${cl ? ' · ' + formatBytes(+cl) : ''}`;
+        } else {
+          el.className  = 'dp-check-result err';
+          el.textContent = `✗ HTTP ${res.status} ${ct !== '—' ? '— ' + ct : ''}`;
+        }
+      },
+      onerror()   { el.className = 'dp-check-result err';  el.textContent = '✗ Network error (CORS or DNS)'; },
+      ontimeout() { el.className = 'dp-check-result warn'; el.textContent = '⏱ Timeout'; },
+      timeout: 12000,
+    });
+  }
+
+  // ─── Panel / tab ─────────────────────────────────────────────────────────────
   function togglePanel() { setOpen(!state.open); }
   function setOpen(v) {
     state.open = v;
     document.getElementById('dp-panel').classList.toggle('open', v);
-    if (v && state.tab === 'logger') renderLogger();
+    if (v && state.tab === 'logger') renderLoggerFull();
   }
-  function switchTab(tab) {
+  function switchMainTab(tab) {
     state.tab = tab;
     document.querySelectorAll('.dp-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
     document.getElementById('dp-executor').classList.toggle('active', tab === 'executor');
     document.getElementById('dp-logger').classList.toggle('active', tab === 'logger');
-    if (tab === 'logger') renderLogger();
+    if (tab === 'logger') renderLoggerFull();
   }
 
   // ─── Toast ────────────────────────────────────────────────────────────────────
-  let _tTimer;
+  let _tt;
   function showToast(msg) {
-    let t = document.getElementById('dp-toast');
-    if (!t) {
-      t = document.createElement('div');
-      t.id = 'dp-toast';
-      GM_addStyle(`
-        #dp-toast {
-          position: fixed; bottom: 72px; left: 20px;
-          background: var(--dp-text); color: var(--dp-bg);
-          font-family: var(--dp-font); font-size: 11px; font-weight: 600;
-          padding: 6px 14px; border-radius: var(--dp-r);
-          z-index: 2147483648; opacity: 0; pointer-events: none;
-          transform: translateY(4px);
-          transition: all .18s ease;
-        }
-        #dp-toast.show { opacity: 1; transform: none; }
-      `);
-      document.documentElement.appendChild(t);
-    }
-    t.textContent = msg;
-    t.classList.add('show');
-    clearTimeout(_tTimer);
-    _tTimer = setTimeout(() => t.classList.remove('show'), 1800);
+    const t = document.getElementById('dp-toast');
+    if (!t) return;
+    t.textContent = msg; t.classList.add('show');
+    clearTimeout(_tt); _tt = setTimeout(() => t.classList.remove('show'), 1800);
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────────
   function escHtml(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
+  function safeStr(v) {
+    if (v === null) return 'null';
+    if (v === undefined) return 'undefined';
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+    try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+  }
+  function formatBytes(n) {
+    if (!n || isNaN(n)) return '?';
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(2) + ' MB';
+  }
 
   // ─── Init ─────────────────────────────────────────────────────────────────────
-  function init() { buildUI(); }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', buildUI);
+  else buildUI();
 
 })();
