@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rvzs — DevPanel
 // @namespace    https://github.com/Celesth/rvzs
-// @version      2.0.0
+// @version      2.1.0
 // @description  Resizable code executor (multi-tab, userscript-level access) + network logger with yt-dlp builder
 // @author       Celesth
 // @match        *://*/*
@@ -45,7 +45,38 @@
     return parts.join(' \\\n  ');
   }
 
+  // ─── Persistence ─────────────────────────────────────────────────────────────
+  const LS_KEY = 'rvzs_dp_state';
+
+  function saveState() {
+    try {
+      const data = {
+        open: state.open,
+        tab: state.tab,
+        execTabs: state.execTabs,
+        activeExecTab: state.activeExecTab,
+        execTabId: state.execTabId,
+        history: state.history,
+        histIdx: state.histIdx,
+        panelW: state.panelW,
+        panelH: state.panelH,
+        panelL: state.panelL,
+        panelB: state.panelB,
+        outH: state.outH,
+      };
+      localStorage.setItem(LS_KEY, JSON.stringify(data));
+    } catch {}
+  }
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch { return null; }
+  }
+
   // ─── State ───────────────────────────────────────────────────────────────────
+  const saved = loadState();
   const state = {
     open:          false,
     tab:           'executor',
@@ -59,11 +90,25 @@
     histIdx:       -1,
     panelW:        760,
     panelH:        560,
-    panelL:        20,   // left px
-    panelB:        20,   // bottom px
+    panelL:        20,
+    panelB:        20,
+    outH:          130,
+    ...(saved ? {
+      tab: saved.tab,
+      execTabs: saved.execTabs,
+      activeExecTab: saved.activeExecTab,
+      execTabId: saved.execTabId,
+      history: saved.history,
+      histIdx: saved.histIdx,
+      panelW: saved.panelW,
+      panelH: saved.panelH,
+      panelL: saved.panelL,
+      panelB: saved.panelB,
+      outH: saved.outH ?? 130,
+    } : {}),
   };
 
-  const _detailOpen = new Set(); // log IDs with detail rows visible
+  const _detailOpen = new Set();
 
   // ─── Request intercept ───────────────────────────────────────────────────────
   let _lid = 0;
@@ -137,7 +182,6 @@
       --dp-shadow:  0 0 0 1px #27272a, 0 20px 60px rgba(0,0,0,0.95);
     }
 
-    /* ── FAB ── */
     #dp-fab {
       position: fixed; bottom: 20px; left: 20px; z-index: 2147483647;
       width: 40px; height: 40px; border-radius: var(--dp-r);
@@ -151,7 +195,6 @@
     #dp-fab:hover  { transform: scale(1.06); box-shadow: 0 4px 20px rgba(0,0,0,0.8); }
     #dp-fab:active { transform: scale(0.96); }
 
-    /* ── Panel ── */
     #dp-panel {
       position: fixed; z-index: 2147483646;
       background: var(--dp-bg); border: 1px solid var(--dp-border);
@@ -162,10 +205,10 @@
       transition: transform .2s cubic-bezier(.34,1.3,.64,1), opacity .15s ease;
       min-width: 400px; min-height: 280px;
     }
-    #dp-panel.open     { transform: none; opacity: 1; pointer-events: all; }
-    #dp-panel.resizing { transition: none; user-select: none; }
+    #dp-panel.open         { transform: none; opacity: 1; pointer-events: all; }
+    #dp-panel.resizing     { transition: none; user-select: none; }
+    #dp-panel.dp-maximized { border-radius: 0; }
 
-    /* ── Resize handles ── */
     .dp-rz {
       position: absolute; z-index: 20; background: transparent;
     }
@@ -177,7 +220,6 @@
     .dp-rz-nw { top:-3px;   left:-3px;  width:12px;  height:12px; cursor:nw-resize; }
     .dp-rz-se { bottom:-3px;right:-3px; width:14px;  height:14px; cursor:se-resize; z-index:21; }
     .dp-rz-sw { bottom:-3px;left:-3px;  width:12px;  height:12px; cursor:sw-resize; }
-    /* Visible corner grip */
     .dp-rz-se::after {
       content:'';position:absolute;bottom:4px;right:4px;
       width:8px;height:8px;
@@ -186,7 +228,6 @@
       border-radius:1px; opacity:.6;
     }
 
-    /* ── Titlebar (drag handle) ── */
     #dp-titlebar {
       display:flex; align-items:center;
       padding:0 14px; height:42px; flex-shrink:0;
@@ -209,7 +250,6 @@
     }
     .dp-close:hover { color:var(--dp-text); background:var(--dp-hover); }
 
-    /* ── Main tabs ── */
     #dp-tabs {
       display:flex; gap:0; border-bottom:1px solid var(--dp-border);
       flex-shrink:0; background:var(--dp-surface); padding:0 10px;
@@ -225,11 +265,9 @@
     .dp-tab:hover { color:var(--dp-text); }
     .dp-tab.active { color:var(--dp-text); border-bottom-color:var(--dp-text); }
 
-    /* ── Panels ── */
     #dp-executor, #dp-logger { display:none; flex:1; flex-direction:column; overflow:hidden; min-height:0; }
     #dp-executor.active, #dp-logger.active { display:flex; }
 
-    /* ── Exec tab strip ── */
     #dp-exec-tabs-bar {
       display:flex; align-items:center;
       border-bottom:1px solid var(--dp-border);
@@ -269,7 +307,6 @@
     }
     #dp-new-tab-btn:hover { color:var(--dp-text); }
 
-    /* ── Exec toolbar ── */
     #dp-exec-toolbar {
       display:flex; align-items:center; gap:6px; padding:6px 12px;
       border-bottom:1px solid var(--dp-border);
@@ -283,7 +320,6 @@
     }
     #dp-exec-actions { margin-left:auto; display:flex; gap:6px; }
 
-    /* ── Buttons ── */
     .dp-btn {
       font-family:var(--dp-font); font-size:10px; font-weight:600;
       letter-spacing:.05em; padding:4px 12px; border-radius:var(--dp-r);
@@ -300,7 +336,6 @@
     .dp-btn-primary:hover  { background:#e4e4e7; border-color:#e4e4e7; }
     .dp-btn-primary:active { background:#d4d4d8; }
 
-    /* ── Editor area ── */
     #dp-editor-area {
       display:flex; flex:1; overflow:hidden; min-height:0;
     }
@@ -324,18 +359,30 @@
     #dp-textarea::selection { background:rgba(255,255,255,0.15); }
     #dp-textarea::placeholder { color:var(--dp-muted2); }
 
-    /* ── Output ── */
+    /* ── Output pane ── */
     #dp-output-wrap {
       flex-shrink:0; display:flex; flex-direction:column;
       border-top:1px solid var(--dp-border);
-      height:130px;
+      position:relative;
     }
+    #dp-output-splitter {
+      position:absolute; top:-4px; left:0; right:0; height:8px;
+      cursor:ns-resize; z-index:10; background:transparent;
+    }
+    #dp-output-splitter:hover,
+    #dp-output-splitter.active { background:rgba(255,255,255,0.06); }
     #dp-output-header {
       display:flex; align-items:center; gap:8px; padding:5px 12px;
       border-bottom:1px solid var(--dp-border);
       background:var(--dp-surface); flex-shrink:0;
     }
     #dp-output-title { font-size:10px; font-weight:600; color:var(--dp-muted); letter-spacing:.06em; }
+    #dp-copy-output {
+      margin-left:auto; background:none; border:none; color:var(--dp-muted2);
+      cursor:pointer; font-size:12px; padding:2px 5px; border-radius:3px;
+      font-family:var(--dp-font); transition:color .1s,background .1s;
+    }
+    #dp-copy-output:hover { color:var(--dp-text); background:var(--dp-hover); }
     #dp-output {
       flex:1; overflow-y:auto; padding:6px 14px;
       scrollbar-width:thin; scrollbar-color:var(--dp-border2) transparent;
@@ -434,7 +481,6 @@
     .dp-dur.fast   { color:#86efac; } .dp-dur.medium { color:#fcd34d; } .dp-dur.slow { color:#f87171; }
     .dp-src-badge { font-size:9px; color:var(--dp-muted2); border:1px solid var(--dp-border); padding:1px 5px; border-radius:3px; }
 
-    /* yt-dlp video button in table */
     .dp-vid-btn {
       font-size:9px; padding:2px 6px; border-radius:3px; cursor:pointer;
       font-family:var(--dp-font); font-weight:700; letter-spacing:.04em;
@@ -443,7 +489,6 @@
     }
     .dp-vid-btn:hover { background:rgba(74,222,128,0.2); }
 
-    /* ── Detail rows ── */
     tr.dp-row-detail { background:var(--dp-dim); border-bottom:1px solid var(--dp-border); }
     tr.dp-row-detail td { padding:10px 14px; }
     .dp-detail-inner { display:flex; flex-direction:column; gap:6px; }
@@ -452,7 +497,6 @@
     .dp-detail-meta span b { color:var(--dp-text); font-weight:500; }
     .dp-detail-actions { display:flex; gap:6px; flex-wrap:wrap; }
 
-    /* yt-dlp command box */
     .dp-ytdlp-box {
       display:none; background:var(--dp-bg);
       border:1px solid rgba(74,222,128,0.2); border-radius:6px;
@@ -465,7 +509,6 @@
     }
     .dp-ytdlp-meta { font-size:9px; color:var(--dp-muted); margin-bottom:8px; }
 
-    /* Link check result */
     .dp-check-result {
       font-size:10px; font-family:var(--dp-font); padding:4px 0;
       display:none;
@@ -475,11 +518,9 @@
     .dp-check-result.err      { display:block; color:var(--dp-err); }
     .dp-check-result.warn     { display:block; color:var(--dp-warn); }
 
-    /* ── Empty ── */
     .dp-empty { text-align:center; padding:40px 20px; color:var(--dp-muted2); font-size:11px; letter-spacing:.04em; }
     .dp-empty-icon { font-size:26px; display:block; margin-bottom:8px; opacity:.4; }
 
-    /* ── Toast ── */
     #dp-toast {
       position:fixed; bottom:68px; left:20px;
       background:var(--dp-text); color:var(--dp-bg);
@@ -490,7 +531,6 @@
     }
     #dp-toast.show { opacity:1; transform:none; }
 
-    /* ── Mobile ── */
     @media (max-width:600px) {
       #dp-panel { left:6px !important; right:6px !important; width:auto !important; bottom:16px !important; min-width:unset; }
       #dp-fab   { left:16px; bottom:16px; }
@@ -500,7 +540,6 @@
 
   // ─── Build UI ─────────────────────────────────────────────────────────────────
   function buildUI() {
-    // FAB
     const fab = document.createElement('button');
     fab.id    = 'dp-fab';
     fab.title = 'DevPanel';
@@ -508,16 +547,13 @@
     document.documentElement.appendChild(fab);
     fab.addEventListener('click', togglePanel);
 
-    // Toast
     const toast = document.createElement('div');
     toast.id = 'dp-toast';
     document.documentElement.appendChild(toast);
 
-    // Panel
     const panel = document.createElement('div');
     panel.id = 'dp-panel';
     panel.innerHTML = `
-      <!-- Resize handles -->
       <div class="dp-rz dp-rz-n"  data-rz="n"></div>
       <div class="dp-rz dp-rz-s"  data-rz="s"></div>
       <div class="dp-rz dp-rz-e"  data-rz="e"></div>
@@ -527,7 +563,6 @@
       <div class="dp-rz dp-rz-se" data-rz="se"></div>
       <div class="dp-rz dp-rz-sw" data-rz="sw"></div>
 
-      <!-- Titlebar (drag) -->
       <div id="dp-titlebar">
         <div class="dp-dots">
           <div class="dp-dot dp-dot-r"></div>
@@ -538,16 +573,13 @@
         <button class="dp-close" id="dp-close">✕</button>
       </div>
 
-      <!-- Main tabs -->
       <div id="dp-tabs">
         <button class="dp-tab active" data-tab="executor">Executor</button>
         <button class="dp-tab" data-tab="logger">Network</button>
       </div>
 
-      <!-- ─ EXECUTOR ─ -->
       <div id="dp-executor" class="active">
         <div id="dp-exec-tabs-bar">
-          <!-- exec tabs injected by JS -->
           <button id="dp-new-tab-btn" title="New tab">+</button>
         </div>
         <div id="dp-exec-toolbar">
@@ -568,14 +600,15 @@
             placeholder="// Full userscript-level access&#10;// unsafeWindow, GM_xmlhttpRequest, fetch, document…&#10;// Ctrl+Enter to run · Alt+↑↓ for history&#10;&#10;console.log(document.title)"></textarea>
         </div>
         <div id="dp-output-wrap">
+          <div id="dp-output-splitter" title="Drag to resize output"></div>
           <div id="dp-output-header">
             <span id="dp-output-title">OUTPUT</span>
+            <button id="dp-copy-output" title="Copy all output">⧉</button>
           </div>
           <div id="dp-output"></div>
         </div>
       </div>
 
-      <!-- ─ LOGGER ─ -->
       <div id="dp-logger">
         <div id="dp-log-toolbar">
           <div id="dp-search-wrap">
@@ -590,6 +623,7 @@
             <button class="dp-mf-btn" data-mf="VIDEO">VIDEO</button>
           </div>
           <span id="dp-log-count">0 reqs</span>
+          <button class="dp-btn dp-btn-ghost" id="dp-export-log" style="padding:3px 8px;font-size:9px" title="Export logs as JSON">↓</button>
           <button class="dp-btn dp-btn-ghost" id="dp-clear-log" style="padding:3px 8px;font-size:9px">Clear</button>
         </div>
         <div id="dp-log-table-wrap">
@@ -613,9 +647,58 @@
     document.documentElement.appendChild(panel);
 
     applyPanelGeometry();
-
-    // Resize & drag
     setupResizeDrag(panel);
+
+    // ── Maximize/restore on titlebar double-click ──
+    let prevGeom = null;
+    panel.querySelector('#dp-titlebar').addEventListener('dblclick', () => {
+      if (panel.classList.contains('dp-maximized')) {
+        if (prevGeom) {
+          state.panelW = prevGeom.w; state.panelH = prevGeom.h;
+          state.panelL = prevGeom.l; state.panelB = prevGeom.b;
+        }
+        panel.classList.remove('dp-maximized');
+      } else {
+        prevGeom = { w: state.panelW, h: state.panelH, l: state.panelL, b: state.panelB };
+        state.panelL = 0; state.panelB = 0;
+        state.panelW = window.innerWidth;
+        state.panelH = window.innerHeight;
+        panel.classList.add('dp-maximized');
+      }
+      applyPanelGeometry();
+      saveState();
+    });
+
+    // ── Output pane resizing ──
+    (function setupOutputResize() {
+      const splitter = document.getElementById('dp-output-splitter');
+      const wrap = document.getElementById('dp-output-wrap');
+      if (!splitter || !wrap) return;
+      let sy = 0, sh = 0;
+      const onMove = (e) => {
+        const dy = e.clientY - sy;
+        const ph = document.getElementById('dp-panel');
+        const avail = (ph ? ph.offsetHeight : 600) - 200; // leave room for toolbar etc
+        const nh = Math.max(60, Math.min(avail, sh - dy));
+        wrap.style.height = nh + 'px';
+        state.outH = nh;
+      };
+      const onUp = () => {
+        splitter.classList.remove('active');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        saveState();
+      };
+      splitter.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        sy = e.clientY;
+        sh = wrap.offsetHeight;
+        splitter.classList.add('active');
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        e.preventDefault();
+      });
+    })();
 
     // Close
     panel.querySelector('#dp-close').addEventListener('click', () => setOpen(false));
@@ -625,19 +708,38 @@
       b.addEventListener('click', () => switchMainTab(b.dataset.tab))
     );
 
+    // Keyboard shortcuts for main tabs
+    document.addEventListener('keydown', (e) => {
+      if (!state.open) return;
+      if (e.ctrlKey && e.key === 'Tab') {
+        e.preventDefault();
+        const tabs = ['executor', 'logger'];
+        const idx = tabs.indexOf(state.tab);
+        switchMainTab(e.shiftKey ? tabs[(idx - 1 + tabs.length) % tabs.length] : tabs[(idx + 1) % tabs.length]);
+      }
+    });
+
     // Executor
     panel.querySelector('#dp-run').addEventListener('click', runCode);
     panel.querySelector('#dp-clear-code').addEventListener('click', () => {
       const ta = document.getElementById('dp-textarea');
-      if (ta) { ta.value = ''; getActiveExecTab().code = ''; updateGutter(); }
+      if (ta) { ta.value = ''; getActiveExecTab().code = ''; updateGutter(); saveState(); }
     });
     panel.querySelector('#dp-clear-output').addEventListener('click', () => {
       const out = document.getElementById('dp-output');
       if (out) out.innerHTML = '';
     });
+    panel.querySelector('#dp-copy-output').addEventListener('click', () => {
+      const out = document.getElementById('dp-output');
+      if (!out) return;
+      const text = Array.from(out.querySelectorAll('.dp-out-line'))
+        .map(el => el.textContent.replace(/^\d{2}:\d{2}:\d{2}\s*/, ''))
+        .join('\n');
+      if (text) { GM_setClipboard(text); showToast('Output copied'); }
+    });
     panel.querySelector('#dp-hist-prev').addEventListener('click', histPrev);
     panel.querySelector('#dp-hist-next').addEventListener('click', histNext);
-    panel.querySelector('#dp-new-tab-btn').addEventListener('click', newExecTab);
+    panel.querySelector('#dp-new-tab-btn').addEventListener('click', () => { newExecTab(); saveState(); });
 
     const ta = panel.querySelector('#dp-textarea');
     ta.addEventListener('keydown', e => {
@@ -651,7 +753,7 @@
       if (e.altKey && e.key === 'ArrowUp')   { e.preventDefault(); histPrev(); }
       if (e.altKey && e.key === 'ArrowDown') { e.preventDefault(); histNext(); }
     });
-    ta.addEventListener('input', () => { getActiveExecTab().code = ta.value; updateGutter(); });
+    ta.addEventListener('input', () => { getActiveExecTab().code = ta.value; updateGutter(); saveState(); });
     ta.addEventListener('scroll', () => {
       const g = document.getElementById('dp-gutter');
       if (g) g.scrollTop = ta.scrollTop;
@@ -667,6 +769,16 @@
       _detailOpen.clear();
       renderLoggerFull();
     });
+    panel.querySelector('#dp-export-log').addEventListener('click', () => {
+      const json = JSON.stringify(state.logs, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `devpanel-logs-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      showToast('Logs exported');
+    });
     panel.querySelectorAll('.dp-mf-btn').forEach(b => {
       b.addEventListener('click', () => {
         panel.querySelectorAll('.dp-mf-btn').forEach(x => x.classList.remove('active'));
@@ -678,6 +790,16 @@
 
     renderExecTabs();
     updateGutter();
+
+    // Restore output height
+    const ow = document.getElementById('dp-output-wrap');
+    if (ow) ow.style.height = state.outH + 'px';
+
+    // Open panel if it was open
+    if (saved?.open) {
+      setOpen(true);
+      if (saved.tab !== 'executor') switchMainTab(saved.tab);
+    }
   }
 
   // ─── Panel geometry ───────────────────────────────────────────────────────────
@@ -725,11 +847,10 @@
       } else {
         if (mode.includes('e')) w = Math.max(MIN_W, startW + dx);
         if (mode.includes('w')) { w = Math.max(MIN_W, startW - dx); l = startL + (startW - w); }
-        if (mode.includes('s')) h = Math.max(MIN_H, startH + dy);  // s = drag down = bigger
+        if (mode.includes('s')) h = Math.max(MIN_H, startH + dy);
         if (mode.includes('n')) { h = Math.max(MIN_H, startH - dy); b = startB + (startH - h); }
       }
 
-      // Clamp to viewport
       l = Math.max(0, Math.min(l, window.innerWidth  - w));
       b = Math.max(0, Math.min(b, window.innerHeight - h));
 
@@ -747,21 +868,19 @@
       panel.classList.remove('resizing');
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
+      saveState();
     };
 
-    // Resize handles
     panel.querySelectorAll('.dp-rz').forEach(el => {
       el.addEventListener('mousedown', e => onDown(e, el.dataset.rz));
     });
 
-    // Drag via titlebar
     const titlebar = panel.querySelector('#dp-titlebar');
     titlebar.addEventListener('mousedown', e => {
       if (e.target.classList.contains('dp-close')) return;
       onDown(e, 'drag');
     });
 
-    // Touch drag (mobile)
     let touchStartX = 0, touchStartY = 0, touchL = 0, touchB = 0;
     titlebar.addEventListener('touchstart', e => {
       const t = e.touches[0];
@@ -775,7 +894,10 @@
       const b = Math.max(0, touchB - (t.clientY - touchStartY));
       panel.style.left   = Math.min(l, window.innerWidth  - panel.offsetWidth)  + 'px';
       panel.style.bottom = Math.min(b, window.innerHeight - panel.offsetHeight) + 'px';
+      state.panelL = parseInt(panel.style.left) || 0;
+      state.panelB = parseInt(panel.style.bottom) || 0;
     }, { passive: true });
+    titlebar.addEventListener('touchend', () => { saveState(); }, { passive: true });
   }
 
   // ─── Exec tabs ───────────────────────────────────────────────────────────────
@@ -787,7 +909,6 @@
     const bar = document.getElementById('dp-exec-tabs-bar');
     if (!bar) return;
     const plusBtn = bar.querySelector('#dp-new-tab-btn');
-    // Remove old tab buttons
     bar.querySelectorAll('.dp-exec-tab').forEach(el => el.remove());
 
     state.execTabs.forEach(tab => {
@@ -804,13 +925,12 @@
         switchExecTab(tab.id);
       });
       const closeEl = btn.querySelector('[data-close]');
-      if (closeEl) closeEl.addEventListener('click', e => { e.stopPropagation(); closeExecTab(tab.id); });
+      if (closeEl) closeEl.addEventListener('click', e => { e.stopPropagation(); closeExecTab(tab.id); saveState(); });
       bar.insertBefore(btn, plusBtn);
     });
   }
 
   function switchExecTab(id) {
-    // Save current code
     const cur = getActiveExecTab();
     const ta  = document.getElementById('dp-textarea');
     if (ta && cur) cur.code = ta.value;
@@ -819,6 +939,7 @@
     const next = getActiveExecTab();
     if (ta && next) { ta.value = next.code || ''; updateGutter(); }
     renderExecTabs();
+    saveState();
   }
 
   function newExecTab() {
@@ -839,6 +960,7 @@
       if (ta) { ta.value = next.code || ''; updateGutter(); }
     }
     renderExecTabs();
+    saveState();
   }
 
   // ─── Gutter ──────────────────────────────────────────────────────────────────
@@ -858,9 +980,9 @@
     const code = ta?.value?.trim();
     if (!code) return;
 
-    // History
     if (state.history[0] !== code) { state.history.unshift(code); if (state.history.length > 50) state.history.pop(); }
     state.histIdx = -1;
+    saveState();
 
     const captured = [];
     const ts = () => new Date().toLocaleTimeString([], { hour12: false });
@@ -874,11 +996,6 @@
       __ret: (v)    => { captured.push({ level:'ret',   text: safeStr(v), t: ts() }); },
     };
 
-    // Execute with full userscript-level access:
-    // - unsafeWindow (page's window)
-    // - GM_xmlhttpRequest (cross-origin requests)
-    // - _origFetch (unwrapped fetch, bypasses our hook)
-    // - document, location all from page scope
     try {
       const fn = new Function(
         'console', 'window', 'unsafeWindow', 'GM_xmlhttpRequest', 'GM_setClipboard', 'fetch', '__ret',
@@ -922,7 +1039,7 @@
     if (ta) { ta.value = state.histIdx === -1 ? '' : state.history[state.histIdx]; getActiveExecTab().code = ta.value; updateGutter(); }
   }
 
-  // ─── Logger: full re-render (used on filter change / tab switch / clear) ─────
+  // ─── Logger: full re-render ──────────────────────────────────────────────────
   function renderLoggerFull() {
     const tbody = document.getElementById('dp-log-tbody');
     const count = document.getElementById('dp-log-count');
@@ -931,7 +1048,6 @@
     const logs = filteredLogs();
     if (count) count.textContent = `${logs.length} req${logs.length !== 1 ? 's' : ''}`;
 
-    // Remove all rows BUT keep detail rows whose IDs are in _detailOpen
     tbody.innerHTML = '';
 
     if (logs.length === 0) {
@@ -942,7 +1058,6 @@
     logs.forEach(log => {
       const row = buildLogRow(log);
       tbody.appendChild(row);
-      // Re-attach open detail rows
       if (_detailOpen.has(log.id)) {
         const detail = buildDetailRow(log);
         tbody.appendChild(detail);
@@ -950,13 +1065,12 @@
     });
   }
 
-  // ─── Logger: prepend single new row (live append without re-render) ───────────
+  // ─── Logger: prepend single new row ──────────────────────────────────────────
   function prependLogRow(log) {
     const tbody = document.getElementById('dp-log-tbody');
     const count = document.getElementById('dp-log-count');
     if (!tbody) return;
 
-    // Remove empty-state row if present
     const empty = tbody.querySelector('td[colspan]');
     if (empty) tbody.innerHTML = '';
 
@@ -1023,7 +1137,6 @@
       row.querySelector('.dp-vid-btn').addEventListener('click', e => {
         e.stopPropagation();
         toggleDetail(log, row);
-        // Also open the ytdlp box
         setTimeout(() => {
           const box = document.querySelector(`.dp-ytdlp-box[data-for-vid="${log.id}"]`);
           if (box && !box.classList.contains('show')) box.classList.add('show');
@@ -1097,27 +1210,25 @@
     return detail;
   }
 
-  // ─── Toggle detail (persistent — stays open when new rows added) ─────────────
+  // ─── Toggle detail ───────────────────────────────────────────────────────────
   function toggleDetail(log, row) {
     const tbody = document.getElementById('dp-log-tbody');
     if (!tbody) return;
 
     const existing = tbody.querySelector(`.dp-row-detail[data-for-log="${log.id}"]`);
     if (existing) {
-      // Toggle visibility, don't remove
       const isHidden = existing.style.display === 'none';
       existing.style.display = isHidden ? '' : 'none';
       if (isHidden) _detailOpen.add(log.id);
       else          _detailOpen.delete(log.id);
     } else {
       const detail = buildDetailRow(log);
-      // Insert after the row (which may not be directly after if row was at top)
       row.insertAdjacentElement('afterend', detail);
       _detailOpen.add(log.id);
     }
   }
 
-  // ─── Link checker (userscript-level cross-origin HEAD request) ───────────────
+  // ─── Link checker ────────────────────────────────────────────────────────────
   function checkLink(url, logId) {
     const el = document.querySelector(`.dp-check-result[data-check-id="${logId}"]`);
     if (!el) return;
@@ -1155,6 +1266,7 @@
     state.open = v;
     document.getElementById('dp-panel').classList.toggle('open', v);
     if (v && state.tab === 'logger') renderLoggerFull();
+    saveState();
   }
   function switchMainTab(tab) {
     state.tab = tab;
